@@ -1,0 +1,8 @@
+node_modules
+dist
+.wrangler
+.DS_Store
+*.log
+
+# 本地发布配置（含自定义域名），不入库
+wrangler.publish.jsonc

@@ -1,0 +1,16 @@
+{
+  "_comment": "复制为 wrangler.publish.jsonc 并把 pattern 改成自己的自定义域名；该文件已在 .gitignore 中，不会入库。",
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "jev-test",
+  "compatibility_date": "2026-09-20",
+  "routes": [
+    { "pattern": "your-custom-domain.example.com", "custom_domain": true }
+  ],
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
