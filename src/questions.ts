@@ -1,4 +1,10 @@
-export type QuestionType = "truefalse" | "single" | "graphic" | "slider" | "longpress";
+export type QuestionType =
+  | "truefalse"
+  | "single"
+  | "graphic"
+  | "slider"
+  | "longpress"
+  | "puzzle";
 
 export interface GraphicVisual {
   kind: "color" | "emoji" | "shape";
@@ -20,6 +26,31 @@ export interface SliderSpec {
   target: number;
   unit?: string;
   tolerance?: number;
+}
+
+/** 拼图验证码的图像场景（纯 CSS 渐变渲染，不依赖任何外部图片资源） */
+export interface PuzzleScene {
+  /** 背景渐变起始色（上） */
+  from: string;
+  /** 背景渐变结束色（下） */
+  to: string;
+  /** 高光圆形（太阳 / 光斑）颜色 */
+  accent: string;
+  /** 高光中心（相对图宽 / 图高比例，0–1） */
+  accentX: number;
+  accentY: number;
+  /** 高光半径（相对图宽比例） */
+  accentR: number;
+}
+
+/** 拼图验证码题参数：把缺图块拖动到图片中缺口的位置 */
+export interface PuzzleSpec {
+  scene: PuzzleScene;
+  /** 缺口中心（相对图宽 / 图高比例，0–1） */
+  gapX: number;
+  gapY: number;
+  /** 判定容差：落点与缺口的归一化距离不超过该值即算正确 */
+  tolerance: number;
 }
 
 export interface QuestionOption {
@@ -45,6 +76,8 @@ export interface Question {
   slider?: SliderSpec;
   /** 长按题：需要持续按住的毫秒数 */
   holdDuration?: number;
+  /** 拼图验证码题参数 */
+  puzzle?: PuzzleSpec;
 }
 
 const tf = (
@@ -152,6 +185,38 @@ const longpressQ = (
   answer: answerId,
   holdDuration: holdMs,
   explanation: `需要在 ${colorName}按钮上连续按住 ${holdMs / 1000} 秒；中途松开不算完成，长按其他颜色则判错。`,
+});
+
+/** 拼图题落点的记录格式：归一化坐标 "x,y"（图内比例，0–1） */
+export const formatPuzzlePoint = (x: number, y: number): string =>
+  `${Math.round(x * 1000) / 1000},${Math.round(y * 1000) / 1000}`;
+
+/** 解析拼图题记录的落点，格式非法时返回 undefined */
+export const parsePuzzlePoint = (raw: string): { x: number; y: number } | undefined => {
+  const [x, y] = raw.split(",").map(Number);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return undefined;
+  return { x, y };
+};
+
+/** 拼图落点是否在缺口容差内 */
+export const puzzleHit = (spec: PuzzleSpec, point: { x: number; y: number }): boolean =>
+  Math.hypot(point.x - spec.gapX, point.y - spec.gapY) <= spec.tolerance;
+
+/** 拼图验证码题快捷构造（归入「人机交互检测」板块）：把缺图块拖到缺口位置 */
+const puzzleQ = (
+  id: number,
+  prompt: string,
+  spec: PuzzleSpec,
+  explanation: string,
+): Question => ({
+  id,
+  type: "puzzle",
+  section: "人机交互检测",
+  prompt,
+  options: [],
+  answer: formatPuzzlePoint(spec.gapX, spec.gapY),
+  puzzle: spec,
+  explanation,
 });
 
 export const QUESTIONS: Question[] = [
@@ -954,6 +1019,48 @@ export const QUESTIONS: Question[] = [
     colorOpt("blue", "#3b82f6", "蓝色按钮"),
     colorOpt("green", "#22c55e", "绿色按钮"),
   ]),
+
+  // ================= 六、人机交互检测 · 拼图验证码（171–175） =================
+  puzzleQ(171, "把下方托盘里的【拼图块】拖到图片中虚线缺口的位置，让图片完整对上来",
+    {
+      scene: { from: "#fb923c", to: "#7c3aed", accent: "#fde68a", accentX: 0.28, accentY: 0.3, accentR: 0.34 },
+      gapX: 0.68,
+      gapY: 0.42,
+      tolerance: 0.05,
+    },
+    "拼图块要落在虚线缺口中心附近，偏差过大（超出容差）就算没对齐。"),
+  puzzleQ(172, "把这张图缺失的【拼图块】拖动回原位，补全图片",
+    {
+      scene: { from: "#38bdf8", to: "#1e3a8a", accent: "#bae6fd", accentX: 0.7, accentY: 0.26, accentR: 0.3 },
+      gapX: 0.32,
+      gapY: 0.58,
+      tolerance: 0.045,
+    },
+    "缺口在图片左下方，注意纵横比例：横向 32%、纵向 58% 处。"),
+  puzzleQ(173, "把下方的【缺失图块】移动到图片里对应的空位上",
+    {
+      scene: { from: "#4ade80", to: "#065f46", accent: "#bbf7d0", accentX: 0.5, accentY: 0.72, accentR: 0.38 },
+      gapX: 0.55,
+      gapY: 0.35,
+      tolerance: 0.05,
+    },
+    "松手时图块中心要落在缺口内，缺口的边缘能对齐上。"),
+  puzzleQ(174, "把【拼图块】移动到图片中缺图的位置，补全这张图",
+    {
+      scene: { from: "#f472b6", to: "#4c1d95", accent: "#fbcfe8", accentX: 0.24, accentY: 0.66, accentR: 0.32 },
+      gapX: 0.25,
+      gapY: 0.4,
+      tolerance: 0.045,
+    },
+    "缺口靠图片左侧，位置大致是横向 25%、纵向 40%。"),
+  puzzleQ(175, "把这张图缺的那一格【拖回去】，让图案接上",
+    {
+      scene: { from: "#fcd34d", to: "#b45309", accent: "#fff7ed", accentX: 0.78, accentY: 0.68, accentR: 0.3 },
+      gapX: 0.72,
+      gapY: 0.62,
+      tolerance: 0.05,
+    },
+    "缺口在图片右下区域，落在容差范围内即算对齐。"),
 ];
 
 export const POINTS_PER_QUESTION = 5;

@@ -18,6 +18,8 @@ export interface ReviewItem {
   chosen?: QuestionOption;
   correct?: QuestionOption;
   chosenNum?: number;
+  /** 拼图题的落点（归一化坐标） */
+  point?: { x: number; y: number };
   isRight: boolean;
 }
 
@@ -50,6 +52,15 @@ export interface LongPressDriver {
   press(optionId: string, signal?: AbortSignal): Promise<void>;
 }
 
+/** 拼图题的命令式驱动：由 PuzzleAnswer 组件注册上来，工具通过它触发一次真实拖动 */
+export interface PuzzleDriver {
+  /**
+   * 把拼图块从托盘拖到归一化坐标 (x, y)（0–1 的图内比例）并松手，落点被记录后 resolve；
+   * 中途 signal abort 则取消拖动、reject，且不记录答案。
+   */
+  drop(x: number, y: number, signal?: AbortSignal): Promise<void>;
+}
+
 export interface QuizActions {
   startQuiz(seed?: string): void;
   answerCurrent(input: { optionId?: string; value?: number }): void;
@@ -57,6 +68,7 @@ export interface QuizActions {
   goToQuestion(number1: number): void;
   submit(): void;
   longPress(optionId: string, signal?: AbortSignal): Promise<void>;
+  puzzleDrop(x: number, y: number, signal?: AbortSignal): Promise<void>;
   /** 让被工具操作的元素短暂高亮，保证工具调用在页面上可见 */
   flash(target: string): void;
 }
@@ -82,6 +94,14 @@ function currentQuestionView(snap: QuizSnapshot) {
       step: q.slider.step,
       unit: q.slider.unit ?? "",
     };
+  } else if (q.type === "puzzle" && q.puzzle) {
+    view.puzzle = {
+      gapX: q.puzzle.gapX,
+      gapY: q.puzzle.gapY,
+      tolerance: q.puzzle.tolerance,
+      hint:
+        "Drag the puzzle piece so its center lands on the hole (gapX / gapY, 0-1 of the image box). Dropping further than tolerance away is judged wrong.",
+    };
   } else if (q.type === "longpress") {
     view.holdDurationSeconds = (q.holdDuration ?? 3000) / 1000;
     view.options = snap.optionsOrder[snap.current].map(optionView);
@@ -104,6 +124,19 @@ function reviewView(item: ReviewItem, number: number) {
       yourValue: item.chosenNum === undefined ? null : item.chosenNum,
       correctValue: q.slider.target,
       unit: q.slider.unit ?? "",
+      explanation: q.explanation,
+    };
+  }
+  if (q.type === "puzzle" && q.puzzle) {
+    return {
+      number,
+      type: q.type,
+      section: q.section,
+      prompt: q.prompt,
+      isRight: item.isRight,
+      yourPoint: item.point ?? null,
+      correctPoint: { x: q.puzzle.gapX, y: q.puzzle.gapY },
+      tolerance: q.puzzle.tolerance,
       explanation: q.explanation,
     };
   }
@@ -196,7 +229,7 @@ export function buildTools(
   const answerCurrent: ModelContextTool = {
     name: "answer_current_question",
     description:
-      "Answer the CURRENT question and record the answer. For truefalse / single / graphic / longpress questions pass optionId (use an id returned by get_current_question). For slider questions pass the exact numeric value. Pass exactly one of the two. For longpress questions the call holds the target button visibly for the required duration (default 3s) and only resolves after the press completes; if it is aborted the question stays unanswered.",
+      "Answer the CURRENT question and record the answer. For truefalse / single / graphic / longpress questions pass optionId (use an id returned by get_current_question). For slider questions pass the exact numeric value. For puzzle questions pass x and y, the normalized 0-1 coordinates inside the image box where the piece is dropped. Pass nothing else. For longpress questions the call holds the target button visibly for the required duration (default 3s) and only resolves after the press completes; if it is aborted the question stays unanswered. Puzzle questions are dragged visibly to (x, y) and released there; if the call is aborted the question stays unanswered.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -210,6 +243,20 @@ export function buildTools(
           type: "number",
           description: "Exact numeric value to move the slider to (slider questions only).",
         },
+        x: {
+          type: "number",
+          minimum: 0,
+          maximum: 1,
+          description:
+            "Horizontal drop position of the puzzle piece, 0-1 of the image width (puzzle questions only).",
+        },
+        y: {
+          type: "number",
+          minimum: 0,
+          maximum: 1,
+          description:
+            "Vertical drop position of the puzzle piece, 0-1 of the image height (puzzle questions only).",
+        },
       },
     },
     execute: async (input, ctx) => {
@@ -219,7 +266,12 @@ export function buildTools(
       if (snap.answers[q.id] !== undefined) {
         throw new Error(`第 ${snap.current + 1} 题已作答，可用 go_to_question 切换题目检查`);
       }
-      const { optionId, value } = (input ?? {}) as { optionId?: unknown; value?: unknown };
+      const { optionId, value, x, y } = (input ?? {}) as {
+        optionId?: unknown;
+        value?: unknown;
+        x?: unknown;
+        y?: unknown;
+      };
       const actions = getActions();
 
       if (q.type === "slider") {
@@ -238,6 +290,26 @@ export function buildTools(
         actions.answerCurrent({ value });
         actions.flash("slider");
         return ok({ recorded: true, number: snap.current + 1, value });
+      }
+
+      if (q.type === "puzzle") {
+        if (typeof optionId !== "undefined" || typeof value !== "undefined") {
+          throw new Error("本题为拼图题，请只传入归一化坐标 x 与 y");
+        }
+        if (
+          typeof x !== "number" ||
+          typeof y !== "number" ||
+          !Number.isFinite(x) ||
+          !Number.isFinite(y)
+        ) {
+          throw new Error("本题为拼图题，请同时传入数值参数 x 与 y（图片内 0–1 的比例坐标）");
+        }
+        if (x < 0 || x > 1 || y < 0 || y > 1) {
+          throw new Error("x / y 必须落在 0 到 1 之间（图片内比例坐标）");
+        }
+        // 忠实模拟：真实拖动到 (x, y) 松手，中途取消则不记录（与人类操作同规则）
+        await actions.puzzleDrop(x, y, ctx.signal);
+        return ok({ recorded: true, number: snap.current + 1, x, y });
       }
 
       if (typeof value !== "undefined") throw new Error("本题为选择题，请只传入 optionId");

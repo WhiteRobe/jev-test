@@ -4,13 +4,19 @@ import {
   POINTS_PER_QUESTION,
   QUESTIONS,
   QUIZ_SIZE,
+  formatPuzzlePoint,
+  parsePuzzlePoint,
+  puzzleHit,
   type GraphicVisual,
+  type PuzzleScene,
+  type PuzzleSpec,
   type Question,
   type QuestionOption,
   type SliderSpec,
 } from "./questions";
 import {
   type LongPressDriver,
+  type PuzzleDriver,
   type QuizActions,
   type QuizSnapshot,
 } from "./webmcp/tools";
@@ -31,6 +37,26 @@ const CLIP_PATHS: Record<string, string> = {
   hexagon: "polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%)",
   star: "polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)",
 };
+
+/** 拼图场景 → CSS 背景：整张"图片"与拼图块共用同一份渐变，拼图块靠 background 偏移取到缺口的像素 */
+const puzzleBackground = (scene: PuzzleScene) =>
+  `radial-gradient(circle at ${scene.accentX * 100}% ${scene.accentY * 100}%, ${scene.accent} 0%, transparent ${scene.accentR * 100}%), ` +
+  `linear-gradient(160deg, ${scene.from} 0%, ${scene.to} 100%)`;
+
+/** 拼图块 / 缺口边长（px） */
+const PUZZLE_TILE = 46;
+/** 托盘与图片的间距、托盘高度（px），两者共同决定拼图块的静止位置 */
+const TRAY_MARGIN = 18;
+const TRAY_HEIGHT = 72;
+/** 键盘微调的步长（小步精调 / Shift 大步） */
+const KEY_STEP = 0.02;
+const KEY_STEP_BIG = 0.1;
+
+const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
+
+/** 拼图落点的文字描述（结果页回看用） */
+const puzzlePointText = (point: { x: number; y: number }) =>
+  `横向 ${(point.x * 100).toFixed(1)}% / 纵向 ${(point.y * 100).toFixed(1)}%`;
 
 function shuffle<T>(items: T[], rand: () => number = Math.random): T[] {
   const result = [...items];
@@ -139,6 +165,8 @@ export function App() {
   const flashTimerRef = useRef<number | undefined>(undefined);
   // 长按题组件注册上来的命令式驱动（仅当前题为长按题时非空）
   const lpDriverRef = useRef<LongPressDriver | null>(null);
+  // 拼图题组件注册上来的命令式驱动（仅当前题为拼图题时非空）
+  const pzDriverRef = useRef<PuzzleDriver | null>(null);
 
   const question = quizQuestions[current];
   const answeredCount = Object.keys(answers).length;
@@ -176,6 +204,11 @@ export function App() {
         const isRight =
           chosenNum !== undefined && Math.abs(chosenNum - q.slider.target) <= tolerance;
         return { question: q, chosen: undefined, correct: undefined, chosenNum, isRight };
+      }
+      if (q.type === "puzzle" && q.puzzle) {
+        const point = chosenId === undefined ? undefined : parsePuzzlePoint(chosenId);
+        const isRight = point !== undefined && puzzleHit(q.puzzle, point);
+        return { question: q, chosen: undefined, correct: undefined, point, isRight };
       }
       const chosen = q.options.find((o) => o.id === chosenId);
       const correct = q.options.find((o) => o.id === q.answer)!;
@@ -237,6 +270,14 @@ export function App() {
         flash(`option:${optionId}`);
       });
     },
+    puzzleDrop: (x, y, signal) => {
+      const driver = pzDriverRef.current;
+      if (!driver) return Promise.reject(new Error("当前题不支持拼图拖动"));
+      return driver.drop(x, y, signal).then(() => {
+        // 拖动落点已记录，给拼图区补一个可见高亮
+        flash("puzzle");
+      });
+    },
     flash,
   };
 
@@ -277,6 +318,7 @@ export function App() {
           <ul className="intro-tips">
             <li>判断题与单选题点击文字选项，图形题点击对应图案。</li>
             <li>人机交互检测题：把滑块精确移动到指定数值，或在指定颜色按钮上连续长按 3 秒（中途松开 / 按错判错）。</li>
+            <li>拼图验证码：把托盘里的缺图块拖到图片中的虚线缺口位置，松手即判定（偏出缺口太多算没对齐）。</li>
             <li>
               每次开始都从 {BANK_SIZE} 题题库中随机抽 {QUIZ_SIZE} 题，{SECTION_ORDER.length}{" "}
               类题型每类至少出现 {PER_SECTION_MIN} 题，每题选项顺序也随机生成。
@@ -322,7 +364,7 @@ export function App() {
           <p className="result-note">{grade.note}</p>
 
           <div className="review-list">
-            {result.detail.map(({ question: q, chosen, correct, chosenNum, isRight }, idx) => (
+            {result.detail.map(({ question: q, chosen, correct, chosenNum, point, isRight }, idx) => (
               <div className={`review-item ${isRight ? "right" : "wrong"}`} key={q.id}>
                 <div className="review-head">
                   <span className="review-no">{idx + 1}</span>
@@ -332,7 +374,24 @@ export function App() {
                   </span>
                 </div>
                 <div className="review-prompt">{q.prompt}</div>
-                {q.type === "slider" && q.slider ? (
+                {q.type === "puzzle" && q.puzzle ? (
+                  <>
+                    <div className="review-answer">
+                      <span className="answer-label">你的落点：</span>
+                      <span className={isRight ? "text-right" : "text-wrong"}>
+                        {point === undefined ? "未作答" : puzzlePointText(point)}
+                      </span>
+                    </div>
+                    {!isRight && (
+                      <div className="review-answer">
+                        <span className="answer-label">缺口位置：</span>
+                        <span className="text-right">
+                          {puzzlePointText({ x: q.puzzle.gapX, y: q.puzzle.gapY })}
+                        </span>
+                      </div>
+                    )}
+                  </>
+                ) : q.type === "slider" && q.slider ? (
                   <>
                     <div className="review-answer">
                       <span className="answer-label">你的位置：</span>
@@ -439,6 +498,16 @@ export function App() {
               value={selected === undefined ? undefined : Number(selected)}
               onChange={(value) => choose(String(value))}
               agentFlash={flashTarget === "slider"}
+            />
+          ) : question.type === "puzzle" && question.puzzle ? (
+            <PuzzleAnswer
+              spec={question.puzzle}
+              value={selected}
+              onChange={choose}
+              registerDriver={(driver) => {
+                pzDriverRef.current = driver;
+              }}
+              agentFlash={flashTarget === "puzzle"}
             />
           ) : question.type === "longpress" ? (
             <LongPressAnswer
@@ -796,6 +865,252 @@ function LongPressAnswer({
         {locked
           ? "本题已作答，可翻页继续"
           : `用手指或鼠标在正确颜色上连续按住 ${duration / 1000} 秒（也可聚焦按钮后长按空格/回车）`}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 拼图验证码题：图片中央留一块虚线缺口，托盘里的拼图块是缺口原本的那一格。
+ * 把拼图块拖到缺口位置松手即判分（落点与缺口中心的归一化距离 ≤ tolerance 算对）。
+ * 支持 Pointer Events（鼠标 / 触屏拖拽），也支持键盘：方向键移动、回车 / 空格确认落点。
+ */
+function PuzzleAnswer({
+  spec,
+  value,
+  onChange,
+  registerDriver,
+  agentFlash = false,
+}: {
+  spec: PuzzleSpec;
+  /** 已记录的落点，格式 "x,y" */
+  value: string | undefined;
+  onChange: (value: string) => void;
+  /** 注册命令式驱动，供 WebMCP 工具发起真实拖动 */
+  registerDriver?: (driver: PuzzleDriver | null) => void;
+  /** 由 WebMCP 工具拖动时短暂高亮 */
+  agentFlash?: boolean;
+}) {
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [stage, setStage] = useState({ w: 0, h: 0 });
+  /** 拖动中的拼图块位置（null = 静止在托盘里）；作答后由 value 决定展示位置 */
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  /** 键盘微调模式：加一点过渡动画，鼠标 / 触屏拖动时必须关掉 */
+  const [keyboardMode, setKeyboardMode] = useState(false);
+  // 拖动 / 动画过程中用 ref 跟随最新位置，避免 pointermove 读到过期闭包
+  const posRef = useRef<{ x: number; y: number } | null>(null);
+  const rafRef = useRef<number | undefined>(undefined);
+  const locked = value !== undefined;
+  const lockedRef = useRef(locked);
+  lockedRef.current = locked;
+  const drop = value === undefined ? undefined : parsePuzzlePoint(value);
+  const isRight = drop !== undefined && puzzleHit(spec, drop);
+
+  const moveTo = (next: { x: number; y: number } | null) => {
+    posRef.current = next;
+    setPos(next);
+  };
+
+  // 拼图块要按整图缩放取色，必须先量出图片实际像素
+  useLayoutEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const measure = () => setStage({ w: el.clientWidth, h: el.clientHeight });
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  // 拼图块在托盘里的静止位置（相对图片区域的比例坐标：y > 1 即图片下方）
+  const idle = { x: 0.5, y: 1 + (TRAY_MARGIN + TRAY_HEIGHT / 2) / (stage.h || 200) };
+  const shown = pos ?? drop ?? idle;
+
+  const pointFromEvent = (event: React.PointerEvent) => {
+    const rect = stageRef.current!.getBoundingClientRect();
+    return {
+      x: clamp01((event.clientX - rect.left) / rect.width),
+      y: clamp01((event.clientY - rect.top) / rect.height),
+    };
+  };
+
+  // 必须从拼图块本体起拖（而不是点一下图片就落块），保证题目的"拖动"语义
+  const startDrag = (event: React.PointerEvent) => {
+    if (locked || stage.w === 0) return;
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    setKeyboardMode(false);
+    moveTo(pointFromEvent(event));
+  };
+
+  const dragMove = (event: React.PointerEvent) => {
+    if (locked || posRef.current === null) return;
+    moveTo(pointFromEvent(event));
+  };
+
+  const dropHere = (event: React.PointerEvent) => {
+    const current = posRef.current;
+    if (locked || current === null) return;
+    event.preventDefault();
+    moveTo(null);
+    onChange(formatPuzzlePoint(current.x, current.y));
+  };
+
+  // 拖动被系统打断（来电、切后台、pointercancel）时收回托盘，不记答案
+  const abortDrag = () => {
+    if (posRef.current === null) return;
+    moveTo(null);
+  };
+
+  const onKeyDown = (event: React.KeyboardEvent) => {
+    if (locked) return;
+    if (event.key === " " || event.key === "Enter") {
+      event.preventDefault();
+      if (event.repeat) return;
+      const current = posRef.current;
+      if (current === null) return;
+      moveTo(null);
+      onChange(formatPuzzlePoint(current.x, current.y));
+      return;
+    }
+    const step = event.shiftKey ? KEY_STEP_BIG : KEY_STEP;
+    // 还没用键盘移动过时，先把拼图块放到图片中央，方便精确微调
+    const base = posRef.current ?? { x: 0.5, y: 0.5 };
+    let next: { x: number; y: number } | null = null;
+    if (event.key === "ArrowLeft") next = { x: base.x - step, y: base.y };
+    else if (event.key === "ArrowRight") next = { x: base.x + step, y: base.y };
+    else if (event.key === "ArrowUp") next = { x: base.x, y: base.y - step };
+    else if (event.key === "ArrowDown") next = { x: base.x, y: base.y + step };
+    if (!next) return;
+    event.preventDefault();
+    setKeyboardMode(true);
+    moveTo({ x: clamp01(next.x), y: clamp01(next.y) });
+  };
+
+  // 向 App 注册工具驱动（每次渲染重注册，保证 locked / spec 等闭包新鲜）
+  useLayoutEffect(() => {
+    if (!registerDriver) return;
+    registerDriver({
+      drop: (x: number, y: number, signal?: AbortSignal) =>
+        new Promise<void>((resolve, reject) => {
+          if (lockedRef.current) {
+            reject(new Error("本题已作答，无法再次拖动"));
+            return;
+          }
+          if (signal?.aborted) {
+            reject(new Error("拖动已被取消"));
+            return;
+          }
+          const from = posRef.current ?? idle;
+          const start = performance.now();
+          const duration = 700;
+          const cancel = () => {
+            if (rafRef.current !== undefined) cancelAnimationFrame(rafRef.current);
+            rafRef.current = undefined;
+            moveTo(null);
+            reject(new Error("拖动在落点前被取消，本次未记录答案"));
+          };
+          signal?.addEventListener("abort", cancel, { once: true });
+          const step = () => {
+            const ratio = Math.min(1, (performance.now() - start) / duration);
+            const eased =
+              ratio < 0.5 ? 2 * ratio * ratio : 1 - ((-2 * ratio + 2) ** 2) / 2;
+            moveTo({
+              x: from.x + (x - from.x) * eased,
+              y: from.y + (y - from.y) * eased,
+            });
+            if (ratio < 1) {
+              rafRef.current = requestAnimationFrame(step);
+              return;
+            }
+            if (rafRef.current !== undefined) cancelAnimationFrame(rafRef.current);
+            rafRef.current = undefined;
+            signal?.removeEventListener("abort", cancel);
+            moveTo(null);
+            onChange(formatPuzzlePoint(x, y));
+            resolve();
+          };
+          rafRef.current = requestAnimationFrame(step);
+        }),
+    });
+    return () => registerDriver(null);
+  });
+
+  // 离开本题时停掉工具发起的拖动动画
+  useEffect(
+    () => () => {
+      if (rafRef.current !== undefined) cancelAnimationFrame(rafRef.current);
+      rafRef.current = undefined;
+    },
+    [],
+  );
+
+  const measured = stage.w > 0 && stage.h > 0;
+  const pieceClass = [
+    "puzzle-piece",
+    pos !== null ? "dragging" : "",
+    keyboardMode && pos !== null ? "keyboard" : "",
+    drop !== undefined ? (isRight ? "pz-right" : "pz-wrong") : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <div className={`puzzle-block${agentFlash ? " agent-flash" : ""}`}>
+      <div
+        className="puzzle-stage"
+        ref={stageRef}
+        style={{
+          backgroundImage: puzzleBackground(spec.scene),
+          backgroundSize: "100% 100%",
+          backgroundRepeat: "no-repeat",
+        }}
+      >
+        <span
+          className={`puzzle-gap${drop !== undefined ? (isRight ? " filled" : " missed") : ""}`}
+          style={{
+            left: `${spec.gapX * 100}%`,
+            top: `${spec.gapY * 100}%`,
+            width: PUZZLE_TILE,
+            height: PUZZLE_TILE,
+          }}
+        />
+        <button
+          type="button"
+          className={pieceClass}
+          style={{
+            left: `${shown.x * 100}%`,
+            top: `${shown.y * 100}%`,
+            width: PUZZLE_TILE,
+            height: PUZZLE_TILE,
+            // 与整图同一份渐变，按缺口位置偏移取色：拖到位才接得上
+            // （负偏移：让图块自身的 0,0 对齐整图里缺口的左上角）
+            backgroundImage: puzzleBackground(spec.scene),
+            backgroundSize: measured ? `${stage.w}px ${stage.h}px` : undefined,
+            backgroundPosition: measured
+              ? `${PUZZLE_TILE / 2 - spec.gapX * stage.w}px ${PUZZLE_TILE / 2 - spec.gapY * stage.h}px`
+              : undefined,
+            backgroundRepeat: "no-repeat",
+          }}
+          disabled={locked}
+          onPointerDown={startDrag}
+          onPointerMove={dragMove}
+          onPointerUp={dropHere}
+          onPointerCancel={abortDrag}
+          onLostPointerCapture={abortDrag}
+          onContextMenu={(event) => event.preventDefault()}
+          onKeyDown={onKeyDown}
+          aria-label="拼图块：按住拖到图片里的虚线缺口，或用方向键移动后按回车确认落点"
+        >
+          {drop !== undefined && <span className="pz-badge">{isRight ? "✓" : "✗"}</span>}
+        </button>
+      </div>
+      <div className="puzzle-tray" style={{ marginTop: TRAY_MARGIN, height: TRAY_HEIGHT }} />
+      <div className="puzzle-hint">
+        {drop === undefined
+          ? "按住拼图块拖到图片中的虚线缺口，松手即判定；也可聚焦后用 ← → ↑ ↓ 微调、Shift + 方向键大步移动、回车 / 空格确认"
+          : isRight
+            ? "拼图已对齐，图片补全成功"
+            : "落点没有对齐缺口，可在解析里查看正确位置"}
       </div>
     </div>
   );
