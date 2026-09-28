@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useEffect, useMemo, useRef, useState } from "react";
 import {
   BANK_SIZE,
   POINTS_PER_QUESTION,
@@ -9,8 +9,17 @@ import {
   type QuestionOption,
   type SliderSpec,
 } from "./questions";
+import {
+  type LongPressDriver,
+  type QuizActions,
+  type QuizSnapshot,
+} from "./webmcp/tools";
+import { useWebMcpTools } from "./webmcp/useWebMcpTools";
 
 type Phase = "intro" | "quiz" | "result";
+
+/** WebMCP 模式开关的 localStorage key */
+const WEBMCP_STORAGE_KEY = "jev-test:webmcp-mode";
 
 const SECTION_ORDER = ["判断对错", "单项选择", "图形点选", "人机交互检测"];
 /** 每次测验每个题型保底出现的题数（4 × 3 = 12，其余 18 题全库随机） */
@@ -23,28 +32,51 @@ const CLIP_PATHS: Record<string, string> = {
   star: "polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)",
 };
 
-function shuffle<T>(items: T[]): T[] {
+function shuffle<T>(items: T[], rand: () => number = Math.random): T[] {
   const result = [...items];
   for (let i = result.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = Math.floor(rand() * (i + 1));
     [result[i], result[j]] = [result[j], result[i]];
   }
   return result;
 }
 
+/** 字符串种子 → 32 位无符号整数（FNV-1a） */
+export function hashSeed(seed: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < seed.length; i += 1) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
+/** mulberry32 确定性伪随机数生成器：同一种子永远产生同一序列 */
+export function mulberry32(seedNum: number): () => number {
+  let a = seedNum;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 /**
  * 从总题库随机抽 QUIZ_SIZE 题：
  * 每个板块先保底抽 PER_SECTION_MIN 题，剩余名额在全题库范围内随机补齐，最后打乱顺序并重新编号。
+ * rand 可注入：默认 Math.random（每次不同），传入种子 PRNG 时结果可复现。
  */
-function pickQuestions(): Question[] {
+export function pickQuestions(rand: () => number = Math.random): Question[] {
   const picked: Question[] = [];
   for (const section of SECTION_ORDER) {
-    const pool = shuffle(QUESTIONS.filter((q) => q.section === section));
+    const pool = shuffle(QUESTIONS.filter((q) => q.section === section), rand);
     picked.push(...pool.slice(0, PER_SECTION_MIN));
   }
-  const restPool = shuffle(QUESTIONS.filter((q) => !picked.includes(q)));
+  const restPool = shuffle(QUESTIONS.filter((q) => !picked.includes(q)), rand);
   picked.push(...restPool.slice(0, QUIZ_SIZE - PER_SECTION_MIN * SECTION_ORDER.length));
-  return shuffle(picked).map((q, index) => ({ ...q, id: index + 1 }));
+  return shuffle(picked, rand).map((q, index) => ({ ...q, id: index + 1 }));
 }
 
 function Shape({ visual, small = false }: { visual: GraphicVisual; small?: boolean }) {
@@ -81,6 +113,8 @@ export function App() {
   const [phase, setPhase] = useState<Phase>("intro");
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [current, setCurrent] = useState(0);
+  // 主界面上的随机种子输入（留空 = 每次真随机；填写后同一抽题结果可复现）
+  const [seedInput, setSeedInput] = useState("");
   // 本次测验的题目：进入页面时先抽一套，点击“开始答题 / 再测一次”会重新随机抽取
   const [quizQuestions, setQuizQuestions] = useState<Question[]>(() => pickQuestions());
 
@@ -89,15 +123,35 @@ export function App() {
     quizQuestions.map((q) => shuffle(q.options)),
   );
 
+  // WebMCP（结构化工具）模式开关；持久化到 localStorage，默认关闭
+  const [webmcpMode, setWebmcpMode] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(WEBMCP_STORAGE_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  // 不支持 document.modelContext 的浏览器（非 Chrome 149+ / 未开 flag）开关会锁定
+  const webmcpSupported = "modelContext" in document;
+
+  // 工具调用时被操作元素的短暂高亮目标（"slider" / "option:<id>"），让工具执行可见
+  const [flashTarget, setFlashTarget] = useState<string | null>(null);
+  const flashTimerRef = useRef<number | undefined>(undefined);
+  // 长按题组件注册上来的命令式驱动（仅当前题为长按题时非空）
+  const lpDriverRef = useRef<LongPressDriver | null>(null);
+
   const question = quizQuestions[current];
   const answeredCount = Object.keys(answers).length;
   const totalScore = quizQuestions.length * POINTS_PER_QUESTION;
   const allAnswered = answeredCount === quizQuestions.length;
 
-  const startQuiz = () => {
-    const picked = pickQuestions();
+  const startQuiz = (seed?: string) => {
+    // 种子为空时真随机；非空时同一种子 → 同一随机序列（题目与选项顺序都可复现）
+    const trimmed = (seed ?? "").trim();
+    const rand = trimmed ? mulberry32(hashSeed(trimmed)) : Math.random;
+    const picked = pickQuestions(rand);
     setQuizQuestions(picked);
-    setOptionsOrder(picked.map((q) => shuffle(q.options)));
+    setOptionsOrder(picked.map((q) => shuffle(q.options, rand)));
     setAnswers({});
     setCurrent(0);
     setPhase("quiz");
@@ -133,12 +187,74 @@ export function App() {
     return { detail, rightCount, score, percent };
   }, [answers, quizQuestions, totalScore]);
 
+  // ---------- WebMCP 模式：快照 / 动作桥 / 工具注册 ----------
+  const toggleWebMcp = (on: boolean) => {
+    setWebmcpMode(on);
+    try {
+      localStorage.setItem(WEBMCP_STORAGE_KEY, on ? "1" : "0");
+    } catch {
+      /* localStorage 不可用时仅本次会话生效 */
+    }
+  };
+
+  const flash = (target: string) => {
+    setFlashTarget(target);
+    if (flashTimerRef.current !== undefined) window.clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => setFlashTarget(null), 800);
+  };
+
+  const getSnapshot = (): QuizSnapshot => ({
+    phase,
+    current,
+    questions: quizQuestions,
+    optionsOrder,
+    answers,
+    result:
+      phase === "result"
+        ? {
+            percent: result.percent,
+            score: result.score,
+            rightCount: result.rightCount,
+            gradeTitle: gradeOf(result.percent).title,
+            detail: result.detail,
+          }
+        : undefined,
+  });
+
+  const actions: QuizActions = {
+    startQuiz: (seed) => startQuiz(seed),
+    answerCurrent: ({ optionId, value }) => {
+      if (optionId !== undefined) choose(optionId);
+      else if (value !== undefined) choose(String(value));
+    },
+    goToQuestion: (number1) => goTo(number1 - 1),
+    submit: () => setPhase("result"),
+    longPress: (optionId, signal) => {
+      const driver = lpDriverRef.current;
+      if (!driver) return Promise.reject(new Error("当前题不支持长按操作"));
+      return driver.press(optionId, signal).then(() => {
+        // 按压走完（答案已记录），给目标按钮补一个可见高亮
+        flash(`option:${optionId}`);
+      });
+    },
+    flash,
+  };
+
+  useWebMcpTools(webmcpMode, phase, getSnapshot, actions);
+
   // ---------- 介绍页 ----------
+  let content: React.ReactNode;
   if (phase === "intro") {
-    return (
+    content = (
       <div className="page">
         <div className="card intro-card">
           <div className="badge">jev-test</div>
+          {webmcpMode && (
+            <div className="mode-banner">
+              WebMCP 模式已开启：本页面向 AI 智能体注册了结构化答题工具，可用 Model Context Tool
+              Inspector 扩展查看与调试。
+            </div>
+          )}
           <h1>综合知识小测验</h1>
           <p className="intro-desc">
             题库共 {BANK_SIZE} 题 · 每次随机抽取 {QUIZ_SIZE} 题 · 满分 {totalScore} 分（折合百分制）· 每题{" "}
@@ -167,18 +283,30 @@ export function App() {
             </li>
             <li>答完可前后翻页检查，全部作答后即可提交，查看总分、评级和逐题解析。</li>
           </ul>
-          <button type="button" className="btn primary large" onClick={startQuiz}>
+          <div className="seed-box">
+            <label htmlFor="seed-input" className="seed-label">
+              随机种子（选填）
+            </label>
+            <input
+              id="seed-input"
+              type="text"
+              className="seed-input"
+              value={seedInput}
+              onChange={(event) => setSeedInput(event.target.value)}
+              placeholder="留空每次完全随机；填写相同种子会抽到同一套题"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <button type="button" className="btn primary large" onClick={() => startQuiz(seedInput)}>
             开始答题
           </button>
         </div>
       </div>
     );
-  }
-
-  // ---------- 结果页 ----------
-  if (phase === "result") {
+  } else if (phase === "result") {
     const grade = gradeOf(result.percent);
-    return (
+    content = (
       <div className="page">
         <div className="card result-card">
           <div className="score-ring" style={{ "--percent": `${result.percent}%` } as React.CSSProperties}>
@@ -245,20 +373,19 @@ export function App() {
             ))}
           </div>
 
-          <button type="button" className="btn primary large" onClick={startQuiz}>
+          <button type="button" className="btn primary large" onClick={() => startQuiz()}>
             再测一次（重新抽题）
           </button>
         </div>
       </div>
     );
-  }
+  } else {
+    // ---------- 答题页 ----------
+    const sectionIndex = SECTION_ORDER.indexOf(question.section);
+    const isLast = current === quizQuestions.length - 1;
+    const selected = answers[question.id];
 
-  // ---------- 答题页 ----------
-  const sectionIndex = SECTION_ORDER.indexOf(question.section);
-  const isLast = current === quizQuestions.length - 1;
-  const selected = answers[question.id];
-
-  return (
+    content = (
     <div className="page">
       <div className="quiz-top">
         <div className="progress-meta">
@@ -311,6 +438,7 @@ export function App() {
               spec={question.slider}
               value={selected === undefined ? undefined : Number(selected)}
               onChange={(value) => choose(String(value))}
+              agentFlash={flashTarget === "slider"}
             />
           ) : question.type === "longpress" ? (
             <LongPressAnswer
@@ -319,6 +447,9 @@ export function App() {
               targetId={question.answer}
               value={selected}
               onChange={choose}
+              registerDriver={(driver) => {
+                lpDriverRef.current = driver;
+              }}
             />
           ) : (
             <div
@@ -338,7 +469,7 @@ export function App() {
                     key={option.id}
                     className={`option ${active ? "selected" : ""} ${
                       question.type === "graphic" ? "option-graphic" : ""
-                    }`}
+                    } ${flashTarget === `option:${option.id}` ? "agent-flash" : ""}`}
                     onClick={() => choose(option.id)}
                     aria-pressed={active}
                   >
@@ -393,6 +524,53 @@ export function App() {
         </aside>
       </div>
     </div>
+    );
+  }
+
+  return (
+    <>
+      {content}
+      <ModeToggle supported={webmcpSupported} mode={webmcpMode} onChange={toggleWebMcp} />
+    </>
+  );
+}
+
+/** 右上角固定的普通 / WebMCP 模式分段开关 */
+function ModeToggle({
+  mode,
+  supported,
+  onChange,
+}: {
+  mode: boolean;
+  supported: boolean;
+  onChange: (on: boolean) => void;
+}) {
+  return (
+    <div className={`mode-switch${mode ? " on" : ""}`} role="group" aria-label="答题模式切换">
+      <button
+        type="button"
+        className={!mode ? "active" : ""}
+        onClick={() => onChange(false)}
+        aria-pressed={!mode}
+      >
+        普通模式
+      </button>
+      <button
+        type="button"
+        className={mode ? "active" : ""}
+        disabled={!supported}
+        aria-pressed={mode}
+        title={
+          supported
+            ? "切换到 WebMCP 模式：向 AI 智能体开放结构化答题工具"
+            : "当前浏览器不支持 WebMCP：需要 Chrome 149+ 并在 chrome://flags/#enable-webmcp-testing 启用"
+        }
+        onClick={() => onChange(true)}
+      >
+        WebMCP 模式
+        {mode && supported && <span className="mode-live-dot" aria-hidden="true" />}
+      </button>
+    </div>
   );
 }
 
@@ -410,17 +588,20 @@ function SliderAnswer({
   spec,
   value,
   onChange,
+  agentFlash = false,
 }: {
   spec: SliderSpec;
   value: number | undefined;
   onChange: (value: number) => void;
+  /** 由 WebMCP 工具设值时短暂高亮 */
+  agentFlash?: boolean;
 }) {
   // 未作答时滑块停在量程中点，仅作为展示位置，不计答案
   const display = value ?? Math.round((spec.min + spec.max) / 2);
   const percent = ((display - spec.min) / (spec.max - spec.min)) * 100;
   const unit = spec.unit ?? "";
   return (
-    <div className="slider-block">
+    <div className={`slider-block${agentFlash ? " agent-flash" : ""}`}>
       <div className="slider-readout">{value === undefined ? "未作答" : `${display}${unit}`}</div>
       <input
         type="range"
@@ -454,18 +635,24 @@ function LongPressAnswer({
   targetId,
   value,
   onChange,
+  registerDriver,
 }: {
   options: QuestionOption[];
   duration: number;
   targetId: string;
   value: string | undefined;
   onChange: (optionId: string) => void;
+  /** 注册命令式驱动，供 WebMCP 工具发起真实按压 */
+  registerDriver?: (driver: LongPressDriver | null) => void;
 }) {
   const [heldId, setHeldId] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const rafRef = useRef<number | undefined>(undefined);
   const startRef = useRef(0);
   const heldRef = useRef<string | null>(null);
+  // 工具发起按压时，用这对 ref 把按压结果回传给 promise
+  const resolveRef = useRef<(() => void) | null>(null);
+  const rejectRef = useRef<((error: Error) => void) | null>(null);
   const locked = value !== undefined;
 
   const cancelRaf = () => {
@@ -483,6 +670,9 @@ function LongPressAnswer({
       heldRef.current = null;
       setHeldId(null);
       onChange(id);
+      resolveRef.current?.();
+      resolveRef.current = null;
+      rejectRef.current = null;
       return;
     }
     rafRef.current = requestAnimationFrame(tick);
@@ -504,9 +694,54 @@ function LongPressAnswer({
     heldRef.current = null;
     setHeldId(null);
     setProgress(0);
+    // 若本次按压由工具发起，按“中途松开”处理：不记录答案并让工具调用失败
+    rejectRef.current?.(new Error("长按在完成前被松开（或被取消），本次未记录答案"));
+    resolveRef.current = null;
+    rejectRef.current = null;
   };
 
-  useEffect(() => () => cancelRaf(), []);
+  // 向 App 注册工具驱动（每次渲染重注册，保证 locked / options 等闭包新鲜）；卸载时清空。
+  // 用 layout effect 在浏览器绘制前完成注册，避免工具在切题后早于 effect 执行。
+  useLayoutEffect(() => {
+    if (!registerDriver) return;
+    registerDriver({
+      press: (optionId: string, signal?: AbortSignal) =>
+        new Promise<void>((resolve, reject) => {
+          if (locked) {
+            reject(new Error("本题已作答，无法再次按压"));
+            return;
+          }
+          if (!options.some((option) => option.id === optionId)) {
+            reject(new Error(`选项「${optionId}」不存在`));
+            return;
+          }
+          if (heldRef.current) {
+            reject(new Error("已有按压进行中"));
+            return;
+          }
+          if (signal?.aborted) {
+            reject(new Error("按压已被取消"));
+            return;
+          }
+          resolveRef.current = resolve;
+          rejectRef.current = reject;
+          // AbortSignal 取消 = 中途松开
+          signal?.addEventListener("abort", cancelHold, { once: true });
+          startHold(optionId);
+        }),
+    });
+    return () => registerDriver(null);
+  });
+
+  useEffect(
+    () => () => {
+      cancelRaf();
+      rejectRef.current?.(new Error("已离开本题，按压取消"));
+      resolveRef.current = null;
+      rejectRef.current = null;
+    },
+    [],
+  );
 
   return (
     <div className="options options-graphic options-longpress">

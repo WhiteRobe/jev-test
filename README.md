@@ -47,3 +47,26 @@ npm run deploy     # = vite build && wrangler deploy
 纯静态资源（`wrangler.jsonc` 中 `assets.directory = ./dist`），不需要 Worker 后端。
 生产环境的自定义域名配置放在未入库的 `wrangler.publish.jsonc`（已加入 `.gitignore`），
 需要发布到自定义域名时使用 `npm run deploy:prod`。
+
+## WebMCP 模式（实验）
+
+页面右上角有「普通模式 / WebMCP 模式」开关，选择持久化在 `localStorage`（默认普通模式）。
+WebMCP 模式下通过命令式 API（`document.modelContext.registerTool`）按页面阶段向 AI 智能体注册结构化答题工具，与"模拟点击"的 GUI 促动赛道对应：
+
+- 介绍页：`get_app_state`、`start_quiz`（支持随机种子）
+- 答题页：`get_current_question`、`answer_current_question`、`go_to_question`、`get_progress`、`submit_quiz`
+- 结果页：`get_result_summary`、`get_question_review`
+
+约束：工具只能作答当前题（须先 `go_to_question` 跳转）；交卷前任何工具返回都不含正确答案与解析；
+长按题由工具驱动一次真实的 3 秒按压（界面上可见倒计时，中途取消则不记录答案）；
+工具操作会在页面上高亮反馈。开关关闭或浏览器不支持时，应用行为与普通模式完全一致，不注册任何工具。
+
+本地调试（Chrome 149+，API 处于 Origin Trial）：
+
+1. 打开 `chrome://flags/#enable-webmcp-testing` 启用并重启 Chrome；
+2. `npm run dev` 后在页面右上角切到 WebMCP 模式；
+3. 安装 Model Context Tool Inspector 扩展，查看注册的工具、校验 JSON Schema 并手动调用。
+
+工具定义见 `src/webmcp/tools.ts`，注册 / 注销生命周期见 `src/webmcp/useWebMcpTools.ts`。
+将来正式部署时还需在 `index.html` 配置 Origin Trial token（本次未包含）。
+

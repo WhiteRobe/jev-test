@@ -177,6 +177,41 @@ body {
   gap: 6px;
 }
 
+/* ---------- 随机种子输入 ---------- */
+.seed-box {
+  margin: 20px 0 4px;
+  text-align: left;
+}
+.seed-label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.seed-input {
+  width: 100%;
+  appearance: none;
+  border: 1.5px dashed var(--border);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 12px;
+  padding: 11px 14px;
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.seed-input::placeholder {
+  color: var(--text-muted);
+  opacity: 0.75;
+}
+.seed-input:focus {
+  border-style: solid;
+  border-color: var(--primary);
+  background: var(--card);
+}
+
 /* ---------- 进度条 ---------- */
 .quiz-top {
   margin-bottom: 14px;
@@ -757,5 +792,92 @@ body {
   }
   .visual-emoji {
     font-size: 38px;
+  }
+}
+
+/* ---------- 右上角普通 / WebMCP 模式开关 ---------- */
+.mode-switch {
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: var(--shadow);
+}
+
+.mode-switch button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.mode-switch button.active {
+  background: var(--primary);
+  color: #fff;
+}
+
+.mode-switch button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.mode-live-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 7px;
+  border-radius: 50%;
+  background: #4ade80;
+  vertical-align: middle;
+}
+
+/* WebMCP 模式下介绍页的说明横幅 */
+.mode-banner {
+  max-width: 560px;
+  margin: 14px auto 0;
+  padding: 9px 14px;
+  font-size: 13px;
+  color: var(--primary);
+  background: var(--primary-soft);
+  border-radius: 10px;
+  text-align: left;
+}
+
+/* 工具调用在页面上的可见反馈：被操作元素短暂高亮一圈 */
+@keyframes agent-flash {
+  0% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 55%, transparent);
+  }
+  100% {
+    box-shadow: none;
+  }
+}
+
+.agent-flash {
+  animation: agent-flash 0.8s ease;
+}
+
+@media (max-width: 560px) {
+  .mode-switch {
+    top: 10px;
+    right: 10px;
+  }
+  .mode-switch button {
+    font-size: 12px;
+    padding: 5px 10px;
   }
 }
