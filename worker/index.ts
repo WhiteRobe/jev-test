@@ -11,6 +11,8 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const api = handleQuestionApi(request);
     if (api) return api;
+    // 非题目接口交给静态资源（SPA fallback）；绑定缺失时给明确报错，别让整个 Worker 崩掉
+    if (!env.ASSETS) return new Response("静态资源绑定 ASSETS 缺失", { status: 500 });
     return env.ASSETS.fetch(request);
   },
 };
