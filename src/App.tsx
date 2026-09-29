@@ -1,9 +1,7 @@
 import { useLayoutEffect, useEffect, useMemo, useRef, useState } from "react";
 import {
-  BANK_SIZE,
+  PER_SECTION_MIN,
   POINTS_PER_QUESTION,
-  QUESTIONS,
-  QUIZ_SIZE,
   UNKNOWN_ANSWER,
   formatPuzzlePoint,
   parsePuzzlePoint,
@@ -13,8 +11,11 @@ import {
   type PuzzleSpec,
   type Question,
   type QuestionOption,
+  type QuestionPayload,
   type SliderSpec,
-} from "./questions";
+} from "./questionTypes";
+import { asQuestion, fetchBankIndex, fetchQuestion, fetchQuestions } from "./api";
+import { hashSeed, mulberry32, pickSlots, sectionOrderOf, shuffle, type LoadMode, type QuizSlot } from "./quiz";
 import {
   type LongPressDriver,
   type PuzzleDriver,
@@ -27,10 +28,8 @@ type Phase = "intro" | "quiz" | "result";
 
 /** WebMCP 模式开关的 localStorage key */
 const WEBMCP_STORAGE_KEY = "jev-test:webmcp-mode";
-
-const SECTION_ORDER = ["判断对错", "单项选择", "图形点选", "人机交互检测"];
-/** 每次测验每个题型保底出现的题数（4 × 4 = 16，其余 14 题全库随机） */
-const PER_SECTION_MIN = 4;
+/** 拉题模式开关的 localStorage key */
+const LOAD_MODE_STORAGE_KEY = "jev-test:load-mode";
 
 const CLIP_PATHS: Record<string, string> = {
   triangle: "polygon(50% 0%, 100% 100%, 0% 100%)",
@@ -69,53 +68,6 @@ function detectWebMcpSupport(): boolean {
 const puzzlePointText = (point: { x: number; y: number }) =>
   `横向 ${(point.x * 100).toFixed(1)}% / 纵向 ${(point.y * 100).toFixed(1)}%`;
 
-function shuffle<T>(items: T[], rand: () => number = Math.random): T[] {
-  const result = [...items];
-  for (let i = result.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(rand() * (i + 1));
-    [result[i], result[j]] = [result[j], result[i]];
-  }
-  return result;
-}
-
-/** 字符串种子 → 32 位无符号整数（FNV-1a） */
-export function hashSeed(seed: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < seed.length; i += 1) {
-    h ^= seed.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return h >>> 0;
-}
-
-/** mulberry32 确定性伪随机数生成器：同一种子永远产生同一序列 */
-export function mulberry32(seedNum: number): () => number {
-  let a = seedNum;
-  return () => {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/**
- * 从总题库随机抽 QUIZ_SIZE 题：
- * 每个板块先保底抽 PER_SECTION_MIN 题，剩余名额在全题库范围内随机补齐，最后打乱顺序并重新编号。
- * rand 可注入：默认 Math.random（每次不同），传入种子 PRNG 时结果可复现。
- */
-export function pickQuestions(rand: () => number = Math.random): Question[] {
-  const picked: Question[] = [];
-  for (const section of SECTION_ORDER) {
-    const pool = shuffle(QUESTIONS.filter((q) => q.section === section), rand);
-    picked.push(...pool.slice(0, PER_SECTION_MIN));
-  }
-  const restPool = shuffle(QUESTIONS.filter((q) => !picked.includes(q)), rand);
-  picked.push(...restPool.slice(0, QUIZ_SIZE - PER_SECTION_MIN * SECTION_ORDER.length));
-  return shuffle(picked, rand).map((q, index) => ({ ...q, id: index + 1 }));
-}
-
 function Shape({ visual, small = false }: { visual: GraphicVisual; small?: boolean }) {
   const size = small ? 22 : visual.size ?? 56;
   const base: React.CSSProperties = {
@@ -152,13 +104,33 @@ export function App() {
   const [current, setCurrent] = useState(0);
   // 主界面上的随机种子输入（留空 = 每次真随机；填写后同一抽题结果可复现）
   const [seedInput, setSeedInput] = useState("");
-  // 本次测验的题目：进入页面时先抽一套，点击“开始答题 / 再测一次”会重新随机抽取
-  const [quizQuestions, setQuizQuestions] = useState<Question[]>(() => pickQuestions());
 
-  // 每次开始答题时随机打乱每题的选项顺序，防止背位置
-  const [optionsOrder, setOptionsOrder] = useState<QuestionOption[][]>(() =>
-    quizQuestions.map((q) => shuffle(q.options)),
-  );
+  // 题库索引（只有 id / type / section）：抽题只需要它，题干一律走 /api/questions
+  const [bank, setBank] = useState<Awaited<ReturnType<typeof fetchBankIndex>> | null>(null);
+  const [bankError, setBankError] = useState<string | null>(null);
+  // 题库索引的重试次数：拉取失败时点「重试」就 +1 重新触发上面的 effect
+  const [bankAttempt, setBankAttempt] = useState(0);
+  // 本次测验的题位：进入页面时先抽一套（介绍页要展示各板块题量），
+  // 点击“开始答题 / 再测一次”会重新随机抽取
+  const [slots, setSlots] = useState<QuizSlot[]>([]);
+  // 单次拉题模式：当前题正文还在接口上（batch 模式不会用到）
+  const [loading, setLoading] = useState(false);
+  // 当前题 / 交卷时的接口错误（页面上给重试入口）
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  // 拉题模式：batch = 开始答题时一次拉齐本次全部题目；single = 翻到哪题才请求哪题
+  const [loadMode, setLoadMode] = useState<LoadMode>(() => {
+    try {
+      return localStorage.getItem(LOAD_MODE_STORAGE_KEY) === "single" ? "single" : "batch";
+    } catch {
+      return "batch";
+    }
+  });
+  // 模式也跟着 ref 走一份：同一个 tick 里先切模式再开始答题时，读到的仍是最新选择
+  const loadModeRef = useRef(loadMode);
+  loadModeRef.current = loadMode;
 
   // WebMCP（结构化工具）模式开关；持久化到 localStorage，默认关闭
   const [webmcpMode, setWebmcpMode] = useState<boolean>(() => {
@@ -190,42 +162,195 @@ export function App() {
   // 拼图题组件注册上来的命令式驱动（仅当前题为拼图题时非空）
   const pzDriverRef = useRef<PuzzleDriver | null>(null);
 
-  const question = quizQuestions[current];
-  const answeredCount = Object.keys(answers).length;
-  const totalScore = quizQuestions.length * POINTS_PER_QUESTION;
-  const allAnswered = answeredCount === quizQuestions.length;
+  // 异步回调里要读最新的 slots / rand，ref 跟随渲染即可（不必放进依赖）
+  const slotsRef = useRef(slots);
+  slotsRef.current = slots;
+  // 本次抽题用的随机序列：题目到位时用它打乱选项顺序，保证同种子结果可复现
+  const randRef = useRef<() => number>(Math.random);
+  // 单次拉题的串行队列：一次只发一个请求，连点「下一题」也按顺序一题一题拉
+  const loadChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  // 已经到位的题位 / 正在飞的拉题请求：同一题不重复请求
+  const loadedRef = useRef<Set<number>>(new Set());
+  const inflightRef = useRef<Map<number, Promise<void>>>(new Map());
+  // 重新抽题的代次：上一次测验遗留的请求回来后直接丢弃
+  const generationRef = useRef(0);
+  // 当前题号：连点「下一题」时也按最新题号往前走
+  const currentRef = useRef(0);
 
-  const startQuiz = (seed?: string) => {
-    // 种子为空时真随机；非空时同一种子 → 同一随机序列（题目与选项顺序都可复现）
+  const slot = slots[current];
+  const question = slot?.question;
+  const options = slot?.options ?? question?.options;
+  const answeredCount = Object.keys(answers).length;
+  const totalScore = slots.length * POINTS_PER_QUESTION;
+  const allAnswered = answeredCount === slots.length;
+  const loadedCount = slots.filter((item) => item.question).length;
+  const sections = bank ? sectionOrderOf(bank.questions) : [];
+
+  // 首次进入：拉题库索引（不含任何题干），抽一套题供介绍页展示；失败可点重试
+  useEffect(() => {
+    let cancelled = false;
+    setBankError(null);
+    void (async () => {
+      try {
+        const index = await fetchBankIndex();
+        if (cancelled) return;
+        setBank(index);
+        setSlots(pickSlots(index.questions));
+      } catch (error) {
+        if (!cancelled) setBankError(error instanceof Error ? error.message : String(error));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [bankAttempt]);
+
+  /** 把接口返回的题目写回对应题位（会话题号覆盖题库 id，选项按本次随机序列打乱） */
+  const fillSlot = (index: number, payload: QuestionPayload) => {
+    const full = payload as Question;
+    loadedRef.current.add(index);
+    setSlots((prev) =>
+      prev.map((item, i) =>
+        i === index
+          ? {
+              ...item,
+              question: { ...full, id: item.number },
+              options: shuffle(full.options, randRef.current),
+            }
+          : item,
+      ),
+    );
+  };
+
+  /** 把多道题按题库 id 写回题位（批量拉题 / 交卷取答案都用它） */
+  const fillSlots = (payloads: QuestionPayload[]) => {
+    const byBankId = new Map(payloads.map((payload) => [payload.id, payload]));
+    setSlots((prev) =>
+      prev.map((item, i) => {
+        const payload = byBankId.get(item.bankId);
+        if (!payload) return item;
+        loadedRef.current.add(i);
+        const full = payload as Question;
+        return {
+          ...item,
+          question: { ...full, id: item.number },
+          options: shuffle(full.options, randRef.current),
+        };
+      }),
+    );
+  };
+
+  /**
+   * 单次拉题：排到串行队列尾部，保证同一时刻只有一个拉题请求在飞。
+   * 同一题已经在飞 / 已经到位的，直接复用那个 promise，不会重复请求。
+   */
+  const enqueueLoad = (index: number): Promise<void> => {
+    if (loadedRef.current.has(index)) return Promise.resolve();
+    const inflight = inflightRef.current.get(index);
+    if (inflight) return inflight;
+    const generation = generationRef.current;
+    const task = async () => {
+      const target = slotsRef.current[index];
+      if (!target || loadedRef.current.has(index)) return;
+      setLoading(true);
+      setLoadError(null);
+      try {
+        const { question: payload } = await fetchQuestion(target.bankId);
+        if (generationRef.current !== generation) return; // 期间已经重新抽题，丢弃这次结果
+        fillSlot(index, payload);
+      } catch (error) {
+        if (generationRef.current !== generation) return;
+        setLoadError(error instanceof Error ? error.message : String(error));
+      } finally {
+        if (generationRef.current === generation) setLoading(false);
+      }
+    };
+    const run = loadChainRef.current.then(task, task);
+    loadChainRef.current = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    inflightRef.current.set(index, run);
+    void run.then(() => {
+      if (inflightRef.current.get(index) === run) inflightRef.current.delete(index);
+    });
+    return run;
+  };
+
+  /** 切题：batch 模式本地已经有题，single 模式立刻去接口拉这一题（返回的 promise 表示这题已就绪） */
+  const goTo = (index: number): Promise<void> => {
+    if (index < 0 || index >= slotsRef.current.length) return Promise.resolve();
+    currentRef.current = index;
+    setCurrent(index);
+    setLoadError(null);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    if (loadModeRef.current !== "single") return Promise.resolve();
+    return enqueueLoad(index);
+  };
+
+  /** 上一题 / 下一题：基于 ref 里的最新题号，连点也能一题一题往前走 */
+  const step = (delta: number) => goTo(currentRef.current + delta);
+
+  const startQuiz = async (seed?: string) => {
+    if (!bank) return;
+    // 种子为空时真随机；非空时同一种子 → 同一抽题结果（题目集合与顺序都可复现）
     const trimmed = (seed ?? "").trim();
     const rand = trimmed ? mulberry32(hashSeed(trimmed)) : Math.random;
-    const picked = pickQuestions(rand);
-    setQuizQuestions(picked);
-    setOptionsOrder(picked.map((q) => shuffle(q.options, rand)));
+    randRef.current = rand;
+    const picked = pickSlots(bank.questions, rand);
+    setSlots(picked);
+    slotsRef.current = picked;
     setAnswers({});
     setCurrent(0);
+    currentRef.current = 0;
+    // 换了一轮题：清掉上一轮的到位记录 / 在飞请求 / 队列
+    generationRef.current += 1;
+    loadedRef.current = new Set();
+    inflightRef.current = new Map();
+    loadChainRef.current = Promise.resolve();
+    setLoading(false);
+    setLoadError(null);
+    setSubmitError(null);
+    setSubmitting(false);
     setPhase("quiz");
     window.scrollTo(0, 0);
+    if (loadModeRef.current === "single") {
+      // 单次拉题：只拉第一题
+      await enqueueLoad(0);
+      return;
+    }
+    // 批量拉题：开始答题时一次拿回本次全部题目（不含答案）
+    setLoading(true);
+    try {
+      const { questions: payloads } = await fetchQuestions(picked.map((item) => item.bankId));
+      fillSlots(payloads);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLoading(false);
+    }
   };
 
   const choose = (optionId: string) => {
+    if (!question) return;
     setAnswers((prev) => ({ ...prev, [question.id]: optionId }));
   };
 
   /** 「我不知道」：记入哨兵答案，视同已作答但判错 */
   const giveUp = () => {
-    if (answers[question.id] !== undefined) return;
+    if (!question || answers[question.id] !== undefined) return;
     choose(UNKNOWN_ANSWER);
     flash("giveup");
   };
 
-  const goTo = (index: number) => {
-    setCurrent(index);
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
-
   const result = useMemo(() => {
-    const detail = quizQuestions.map((q) => {
+    // 题目没到齐（不该发生：交卷前会统一取回）时先不算成绩
+    const questions: Question[] = [];
+    for (const item of slots) {
+      if (!item.question) return null;
+      questions.push(item.question);
+    }
+    const detail = questions.map((q) => {
       const chosenId = answers[q.id];
       // 「我不知道」：视同已作答，但一定判错
       if (chosenId === UNKNOWN_ANSWER) {
@@ -250,15 +375,46 @@ export function App() {
     });
     const rightCount = detail.filter((d) => d.isRight).length;
     const score = rightCount * POINTS_PER_QUESTION;
-    const percent = Math.round((score / totalScore) * 100);
+    const percent = totalScore === 0 ? 0 : Math.round((score / totalScore) * 100);
     return { detail, rightCount, score, percent };
-  }, [answers, quizQuestions, totalScore]);
+  }, [answers, slots, totalScore]);
+
+  /** 交卷：答案与解析只在这一刻下发（reveal=1），取齐后一次性判分 */
+  const submit = async () => {
+    if (submitting) return;
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      // 先等正在飞行的单次拉题收尾，避免交卷时还有请求在改 slots
+      await loadChainRef.current;
+      const ids = slotsRef.current.map((item) => item.bankId);
+      const { questions: payloads } = await fetchQuestions(ids, true);
+      payloads.forEach(asQuestion); // 缺答案 / 解析就直接抛错，不进结果页
+      fillSlots(payloads);
+      setPhase("result");
+      window.scrollTo(0, 0);
+    } catch (error) {
+      setSubmitError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   // ---------- WebMCP 模式：快照 / 动作桥 / 工具注册 ----------
   const toggleWebMcp = (on: boolean) => {
     setWebmcpMode(on);
     try {
       localStorage.setItem(WEBMCP_STORAGE_KEY, on ? "1" : "0");
+    } catch {
+      /* localStorage 不可用时仅本次会话生效 */
+    }
+  };
+
+  const toggleLoadMode = (mode: LoadMode) => {
+    loadModeRef.current = mode;
+    setLoadMode(mode);
+    try {
+      localStorage.setItem(LOAD_MODE_STORAGE_KEY, mode === "single" ? "single" : "batch");
     } catch {
       /* localStorage 不可用时仅本次会话生效 */
     }
@@ -273,11 +429,12 @@ export function App() {
   const getSnapshot = (): QuizSnapshot => ({
     phase,
     current,
-    questions: quizQuestions,
-    optionsOrder,
+    loadMode,
+    loading,
+    slots,
     answers,
     result:
-      phase === "result"
+      phase === "result" && result
         ? {
             percent: result.percent,
             score: result.score,
@@ -295,7 +452,7 @@ export function App() {
       else if (value !== undefined) choose(String(value));
     },
     goToQuestion: (number1) => goTo(number1 - 1),
-    submit: () => setPhase("result"),
+    submit: () => submit(),
     giveUp: () => giveUp(),
     longPress: (optionId, signal) => {
       const driver = lpDriverRef.current;
@@ -331,14 +488,26 @@ export function App() {
               Inspector 扩展查看与调试。
             </div>
           )}
+          {bankError && (
+            <div className="load-error">
+              题库加载失败：{bankError}
+              <button
+                type="button"
+                className="btn ghost load-retry"
+                onClick={() => setBankAttempt((n) => n + 1)}
+              >
+                重试
+              </button>
+            </div>
+          )}
           <h1>综合知识小测验</h1>
           <p className="intro-desc">
-            题库共 {BANK_SIZE} 题 · 每次随机抽取 {QUIZ_SIZE} 题 · 满分 {totalScore} 分（折合百分制）· 每题{" "}
-            {POINTS_PER_QUESTION} 分
+            题库共 {bank?.bankSize ?? "…"} 题 · 每次随机抽取 {bank?.quizSize ?? slots.length} 题 · 满分{" "}
+            {totalScore} 分（折合百分制）· 每题 {POINTS_PER_QUESTION} 分
           </p>
           <div className="section-grid">
-            {SECTION_ORDER.map((name, idx) => {
-              const count = quizQuestions.filter((q) => q.section === name).length;
+            {sections.map((name, idx) => {
+              const count = slots.filter((item) => item.section === name).length;
               return (
                 <div className="section-item" key={name}>
                   <span className="section-index">{idx + 1}</span>
@@ -361,11 +530,25 @@ export function App() {
               任何题都可以点右侧的「我不知道」直接作答：视同已作答（能交卷），但本题计为错误。
             </li>
             <li>
-              每次开始都从 {BANK_SIZE} 题题库中随机抽 {QUIZ_SIZE} 题，{SECTION_ORDER.length}{" "}
-              类题型每类至少出现 {PER_SECTION_MIN} 题，每题选项顺序也随机生成。
+              每次开始都从 {bank?.bankSize ?? "…"} 题题库中随机抽 {bank?.quizSize ?? slots.length} 题，
+              {sections.length} 类题型每类至少出现 {PER_SECTION_MIN} 题，每题选项顺序也随机生成。
             </li>
-            <li>答完可前后翻页检查，全部作答后即可提交，查看总分、评级和逐题解析。</li>
+            <li>
+              拉题模式：见下方「拉题模式」开关。
+            </li>
+            <li>答完可前后翻页检查，全部作答后即可提交，查看总分、评级和逐题解析（答案与解析在交卷时才下发）。</li>
           </ul>
+          <div className="load-mode-box">
+            <div className="load-mode-row">
+              <span className="load-mode-label">拉题模式</span>
+              <LoadModeToggle mode={loadMode} onChange={toggleLoadMode} />
+            </div>
+            <span className="load-mode-hint">
+              {loadMode === "single"
+                ? "单次拉题：点题号 / 下一题时才向 /api/questions/:id 请求这一题，一道一题地取，不会一次性跑完。"
+                : "批量拉题（默认）：点「开始答题」时一次向 /api/questions?ids=… 请求本次全部题目。"}
+            </span>
+          </div>
           <div className="seed-box">
             <label htmlFor="seed-input" className="seed-label">
               随机种子（选填）
@@ -381,13 +564,18 @@ export function App() {
               spellCheck={false}
             />
           </div>
-          <button type="button" className="btn primary large" onClick={() => startQuiz(seedInput)}>
-            开始答题
+          <button
+            type="button"
+            className="btn primary large"
+            onClick={() => startQuiz(seedInput)}
+            disabled={!bank || loading}
+          >
+            {bank ? "开始答题" : "题库加载中…"}
           </button>
         </div>
       </div>
     );
-  } else if (phase === "result") {
+  } else if (phase === "result" && result) {
     const grade = gradeOf(result.percent);
     content = (
       <div className="page">
@@ -400,7 +588,7 @@ export function App() {
           <p className="result-summary">
             原始得分 <strong>{result.score}</strong> / {totalScore} · 答对{" "}
             <strong>{result.rightCount}</strong> 题 · 答错{" "}
-            <strong>{quizQuestions.length - result.rightCount}</strong> 题
+            <strong>{slots.length - result.rightCount}</strong> 题
           </p>
           <p className="result-note">{grade.note}</p>
 
@@ -515,25 +703,33 @@ export function App() {
     );
   } else {
     // ---------- 答题页 ----------
-    const sectionIndex = SECTION_ORDER.indexOf(question.section);
-    const isLast = current === quizQuestions.length - 1;
-    const selected = answers[question.id];
+    const sectionIndex = sections.indexOf(question?.section ?? slot?.section ?? "");
+    const isLast = current === slots.length - 1;
+    const selected = question ? answers[question.id] : undefined;
     // 点了「我不知道」：本题按答错锁定，交互控件不再改动答案
     const gaveUp = selected === UNKNOWN_ANSWER;
+    // 单次拉题模式下这一题还没到（或拉取失败）：先占位，不渲染任何可作答控件
+    const pending = !question;
 
     content = (
     <div className="page">
       <div className="quiz-top">
         <div className="progress-meta">
-          <span>
-            第 <strong>{current + 1}</strong> / {quizQuestions.length} 题
+          <span className="progress-left">
+            <span>
+              第 <strong>{current + 1}</strong> / {slots.length} 题
+            </span>
+            <LoadModeToggle mode={loadMode} onChange={toggleLoadMode} compact />
+            {loadMode === "single" && (
+              <span className="load-count">已拉取 {loadedCount}/{slots.length}</span>
+            )}
+            <span className="progress-count">已答 {answeredCount} 题</span>
           </span>
-          <span className="progress-count">已答 {answeredCount} 题</span>
         </div>
         <div className="progress-track">
           <div
             className="progress-fill"
-            style={{ width: `${((current + 1) / quizQuestions.length) * 100}%` }}
+            style={{ width: `${((current + 1) / Math.max(1, slots.length)) * 100}%` }}
           />
         </div>
       </div>
@@ -542,13 +738,13 @@ export function App() {
         {/* 左侧：题号导航（两列） */}
         <aside className="rail rail-left card">
           <div className="pager pager-cols">
-            {quizQuestions.map((q: Question, idx) => {
+            {slots.map((item, idx) => {
               const state =
-                answers[q.id] === undefined ? "unanswered" : idx === current ? "current" : "done";
+                answers[item.number] === undefined ? "unanswered" : idx === current ? "current" : "done";
               return (
                 <button
                   type="button"
-                  key={q.id}
+                  key={item.number}
                   className={`pager-dot ${state}`}
                   onClick={() => goTo(idx)}
                   title={`第 ${idx + 1} 题`}
@@ -562,6 +758,35 @@ export function App() {
 
         {/* 中间：题目卡片 */}
         <div className="card question-card">
+          {pending ? (
+            <div className="load-state">
+              {loadError ? (
+                <>
+                  <p className="load-state-title">第 {current + 1} 题拉取失败</p>
+                  <p className="load-state-note">{loadError}</p>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    onClick={() => enqueueLoad(current)}
+                  >
+                    重新拉取这一题
+                  </button>
+                </>
+              ) : (
+                <>
+                  <p className="load-state-title">
+                    正在拉取第 {current + 1} 题…
+                  </p>
+                  <p className="load-state-note">
+                    {loadMode === "single"
+                      ? "单次拉题模式：这一题的正文此刻才从 /api/questions 请求（可继续点下一题，会按顺序一题一题拉）"
+                      : "批量拉题模式：正在取回本次抽中的全部题目"}
+                  </p>
+                </>
+              )}
+            </div>
+          ) : (
+            <>
           <div className="question-head">
             <span className={`question-section section-color-${sectionIndex}`}>
               {sectionIndex + 1}. {question.section}
@@ -590,7 +815,7 @@ export function App() {
             />
           ) : question.type === "longpress" ? (
             <LongPressAnswer
-              options={optionsOrder[current]}
+              options={options ?? question.options}
               duration={question.holdDuration ?? 3000}
               targetId={question.answer}
               value={gaveUp ? undefined : selected}
@@ -610,7 +835,7 @@ export function App() {
                     : "options"
               }
             >
-              {optionsOrder[current].map((option) => {
+              {(options ?? question.options).map((option) => {
                 const active = selected === option.id;
                 return (
                   <button
@@ -645,6 +870,8 @@ export function App() {
           {gaveUp && (
             <div className="giveup-note">本题已按「我不知道」记为答错，可翻页继续。</div>
           )}
+            </>
+          )}
         </div>
 
         {/* 右侧：翻页 + 交卷 */}
@@ -652,7 +879,7 @@ export function App() {
           <button
             type="button"
             className="btn ghost rail-btn"
-            onClick={() => goTo(current - 1)}
+            onClick={() => step(-1)}
             disabled={current === 0}
           >
             ↑ 上一题
@@ -660,7 +887,7 @@ export function App() {
           <button
             type="button"
             className="btn primary rail-btn"
-            onClick={() => goTo(current + 1)}
+            onClick={() => step(1)}
             disabled={isLast}
           >
             下一题 ↓
@@ -668,11 +895,19 @@ export function App() {
           <button
             type="button"
             className="btn primary rail-btn submit-btn"
-            onClick={() => setPhase("result")}
-            disabled={!allAnswered}
-            title={allAnswered ? "提交并查看成绩" : `还有 ${quizQuestions.length - answeredCount} 题未作答`}
+            onClick={() => submit()}
+            disabled={!allAnswered || submitting}
+            title={
+              allAnswered
+                ? "提交并查看成绩（此时才会向接口取回答案与解析）"
+                : `还有 ${slots.length - answeredCount} 题未作答`
+            }
           >
-            {allAnswered ? "提交并查看成绩" : `还差 ${quizQuestions.length - answeredCount} 题`}
+            {submitting
+              ? "正在结算…"
+              : allAnswered
+                ? "提交并查看成绩"
+                : `还差 ${slots.length - answeredCount} 题`}
           </button>
           <button
             type="button"
@@ -680,11 +915,12 @@ export function App() {
               flashTarget === "giveup" ? "agent-flash" : ""
             }`}
             onClick={giveUp}
-            disabled={selected !== undefined}
+            disabled={pending || selected !== undefined}
             title="不会做也可以作答：视同已作答，但本题计为错误"
           >
             我不知道
           </button>
+          {submitError && <div className="load-error">交卷失败：{submitError}</div>}
         </aside>
       </div>
     </div>
@@ -742,6 +978,45 @@ function ModeToggle({
       >
         WebMCP 模式
         {mode && supported && <span className="mode-live-dot" aria-hidden="true" />}
+      </button>
+    </div>
+  );
+}
+
+/** 批量 / 单次拉题模式分段开关（选择持久化到 localStorage，默认批量） */
+function LoadModeToggle({
+  mode,
+  onChange,
+  compact = false,
+}: {
+  mode: LoadMode;
+  onChange: (mode: LoadMode) => void;
+  /** 答题页顶栏用的紧凑样式 */
+  compact?: boolean;
+}) {
+  const className = `mode-switch load-mode-switch inline${compact ? " compact" : ""}${
+    mode === "single" ? " on" : ""
+  }`;
+  return (
+    <div className={className} role="group" aria-label="拉题模式切换">
+      <button
+        type="button"
+        className={mode === "batch" ? "active" : ""}
+        onClick={() => onChange("batch")}
+        aria-pressed={mode === "batch"}
+        title="批量拉题（默认）：点「开始答题」时一次向 /api/questions?ids=… 取回本次全部题目"
+      >
+        批量拉题
+      </button>
+      <button
+        type="button"
+        className={mode === "single" ? "active" : ""}
+        onClick={() => onChange("single")}
+        aria-pressed={mode === "single"}
+        title="单次拉题：点题号 / 下一题时才向 /api/questions/:id 请求这一题，一道一题地取"
+      >
+        单次拉题
+        {mode === "single" && <span className="mode-live-dot" aria-hidden="true" />}
       </button>
     </div>
   );

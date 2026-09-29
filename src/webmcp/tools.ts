@@ -4,7 +4,8 @@ import {
   UNKNOWN_ANSWER,
   type Question,
   type QuestionOption,
-} from "../questions";
+} from "../questionTypes";
+import type { LoadMode, QuizSlot } from "../quiz";
 
 // WebMCP 模式下向 AI 智能体开放的结构化工具。
 // 设计约束：
@@ -39,9 +40,12 @@ export interface QuizSnapshot {
   phase: QuizPhase;
   /** 0-based 当前题下标 */
   current: number;
-  questions: Question[];
-  /** 每题按展示顺序排列的选项（抽题时已随机打乱） */
-  optionsOrder: QuestionOption[][];
+  /** 拉题模式：batch = 开局一次拉齐；single = 翻到哪题拉哪题 */
+  loadMode: LoadMode;
+  /** 当前题正文还在接口上（只可能出现在 single 模式） */
+  loading: boolean;
+  /** 本次测验的题位：题目正文可能还没到位 */
+  slots: QuizSlot[];
   answers: Record<number, string>;
   result?: QuizResultSnapshot;
 }
@@ -65,11 +69,12 @@ export interface PuzzleDriver {
 }
 
 export interface QuizActions {
-  startQuiz(seed?: string): void;
+  startQuiz(seed?: string): Promise<void>;
   answerCurrent(input: { optionId?: string; value?: number }): void;
-  /** 跳到 1-based 题号 */
-  goToQuestion(number1: number): void;
-  submit(): void;
+  /** 跳到 1-based 题号；单次拉题模式下 resolve 时该题已从接口取回 */
+  goToQuestion(number1: number): Promise<void>;
+  /** 交卷：resolve 时成绩已算好（答案与解析在这一刻才从接口取回） */
+  submit(): Promise<void>;
   /** 记为「我不知道」：视同已作答但判错（对应页面上的同名按钮） */
   giveUp(): void;
   longPress(optionId: string, signal?: AbortSignal): Promise<void>;
@@ -82,9 +87,24 @@ const ok = (data: Record<string, unknown>): string => JSON.stringify({ ok: true,
 
 const optionView = (option: QuestionOption) => ({ id: option.id, label: option.label });
 
+/** 取当前题位；题目正文还没到位时抛错（工具要重试或先 go_to_question） */
+function currentSlot(snap: QuizSnapshot): { slot: QuizSlot; question: Question } {
+  const slot = snap.slots[snap.current];
+  if (!slot) throw new Error(`当前题号 ${snap.current + 1} 不存在`);
+  if (!slot.question) {
+    throw new Error(
+      snap.loading
+        ? `第 ${snap.current + 1} 题正在从 /api/questions 拉取中，稍后重试`
+        : `第 ${snap.current + 1} 题还没拉到（可重新调用 go_to_question 触发拉取）`,
+    );
+  }
+  return { slot, question: slot.question };
+}
+
 /** 当前题的对外视图：只包含页面上本来就可见的信息，绝不含正确答案 */
 function currentQuestionView(snap: QuizSnapshot) {
-  const q = snap.questions[snap.current];
+  const { slot, question: q } = currentSlot(snap);
+  const options = slot.options ?? q.options;
   const view: Record<string, unknown> = {
     number: snap.current + 1,
     type: q.type,
@@ -111,9 +131,9 @@ function currentQuestionView(snap: QuizSnapshot) {
     };
   } else if (q.type === "longpress") {
     view.holdDurationSeconds = (q.holdDuration ?? 3000) / 1000;
-    view.options = snap.optionsOrder[snap.current].map(optionView);
+    view.options = options.map(optionView);
   } else {
-    view.options = snap.optionsOrder[snap.current].map(optionView);
+    view.options = options.map(optionView);
   }
   return view;
 }
@@ -179,16 +199,22 @@ export function buildTools(
     annotations: { readOnlyHint: true },
     execute: async () => {
       const snap = getSnapshot();
-      const data: Record<string, unknown> = { mode: "webmcp", phase: snap.phase };
+      const data: Record<string, unknown> = {
+        mode: "webmcp",
+        phase: snap.phase,
+        loadMode: snap.loadMode,
+      };
       if (snap.phase === "intro") {
         data.quizLength = QUIZ_SIZE;
-        data.hint = "Call start_quiz to begin (an optional seed reproduces the same question set).";
+        data.hint =
+          "Call start_quiz to begin (an optional seed reproduces the same question set). It resolves once the questions have been fetched; with loadMode=single only the first question is fetched at this point.";
       } else if (snap.phase === "quiz") {
-        data.totalQuestions = snap.questions.length;
+        data.totalQuestions = snap.slots.length;
         data.currentQuestion = snap.current + 1;
         data.answeredCount = Object.keys(snap.answers).length;
+        data.currentQuestionLoading = snap.loading;
         data.hint =
-          "Call get_current_question, then answer_current_question. You can only answer the current question; use go_to_question to move.";
+          "Call get_current_question, then answer_current_question. You can only answer the current question; use go_to_question to move (it resolves once that question has been fetched).";
       } else {
         data.percent = snap.result?.percent;
         data.hint =
@@ -202,7 +228,7 @@ export function buildTools(
   const startQuiz: ModelContextTool = {
     name: "start_quiz",
     description:
-      "Start a brand-new quiz with freshly randomized questions and enter the quiz page. On the result page this starts another attempt ('retry').",
+      "Start a brand-new quiz with freshly randomized questions and enter the quiz page. On the result page this starts another attempt ('retry'). Resolves once the questions are ready: in single-fetch mode only question 1 is fetched here, the rest arrive one by one through go_to_question.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -216,8 +242,8 @@ export function buildTools(
     },
     execute: async (input) => {
       const seed = (input as { seed?: unknown }).seed;
-      getActions().startQuiz(typeof seed === "string" && seed.trim() ? seed : undefined);
-      return ok({ started: true, totalQuestions: QUIZ_SIZE });
+      await getActions().startQuiz(typeof seed === "string" && seed.trim() ? seed : undefined);
+      return ok({ started: true, totalQuestions: getSnapshot().slots.length });
     },
   };
 
@@ -272,7 +298,7 @@ export function buildTools(
     execute: async (input, ctx) => {
       const snap = getSnapshot();
       if (snap.phase !== "quiz") throw new Error("当前不在答题阶段，可先调用 start_quiz 开始测验");
-      const q = snap.questions[snap.current];
+      const { question: q } = currentSlot(snap);
       if (snap.answers[q.id] !== undefined) {
         throw new Error(`第 ${snap.current + 1} 题已作答，可用 go_to_question 切换题目检查`);
       }
@@ -355,7 +381,7 @@ export function buildTools(
   const goToQuestion: ModelContextTool = {
     name: "go_to_question",
     description:
-      "Jump to a question by its 1-based number so it becomes the current question (answers are preserved). Use this to review or answer earlier/later questions.",
+      "Jump to a question by its 1-based number so it becomes the current question (answers are preserved). Use this to review or answer earlier/later questions. In single-fetch mode this call also fetches that question from the API and only resolves once it has arrived.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -370,10 +396,10 @@ export function buildTools(
       if (typeof number !== "number" || !Number.isInteger(number)) {
         throw new Error("number 必须是从 1 开始的整数题号");
       }
-      if (number < 1 || number > snap.questions.length) {
-        throw new Error(`题号超出范围：只到第 ${snap.questions.length} 题`);
+      if (number < 1 || number > snap.slots.length) {
+        throw new Error(`题号超出范围：只到第 ${snap.slots.length} 题`);
       }
-      getActions().goToQuestion(number);
+      await getActions().goToQuestion(number);
       return ok({ currentQuestion: number });
     },
   };
@@ -392,12 +418,12 @@ export function buildTools(
         ok: true,
         currentQuestion: snap.current + 1,
         answeredCount: Object.keys(snap.answers).length,
-        totalQuestions: snap.questions.length,
-        questions: snap.questions.map((q, index) => ({
+        totalQuestions: snap.slots.length,
+        questions: snap.slots.map((slot, index) => ({
           number: index + 1,
-          section: q.section,
-          type: q.type,
-          answered: snap.answers[q.id] !== undefined,
+          section: slot.section,
+          type: slot.type,
+          answered: snap.answers[slot.number] !== undefined,
           current: index === snap.current,
         })),
       });
@@ -408,16 +434,16 @@ export function buildTools(
   const submitQuiz: ModelContextTool = {
     name: "submit_quiz",
     description:
-      "Submit the quiz and move to the result page. Only allowed when every question is answered; otherwise the tool reports how many remain.",
+      "Submit the quiz and move to the result page. Only allowed when every question is answered; otherwise the tool reports how many remain. Resolves once the answer key has been fetched and the score is computed.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     execute: async () => {
       const snap = getSnapshot();
       if (snap.phase !== "quiz") throw new Error("当前不在答题阶段，无法交卷");
-      const unanswered = snap.questions.length - Object.keys(snap.answers).length;
+      const unanswered = snap.slots.length - Object.keys(snap.answers).length;
       if (unanswered > 0) {
         throw new Error(`还有 ${unanswered} 题未作答，全部作答后才能交卷（可用 get_progress 查看）`);
       }
-      getActions().submit();
+      await getActions().submit();
       return ok({ submitted: true, hint: "已交卷，可调用 get_result_summary 查看成绩" });
     },
   };
