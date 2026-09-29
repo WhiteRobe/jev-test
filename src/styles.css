@@ -309,6 +309,14 @@ body {
 .option:hover {
   border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
 }
+/* 点了「我不知道」后选项不再可点 */
+.option:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.option:disabled:hover {
+  border-color: var(--border);
+}
 .option.selected {
   border-color: var(--primary);
   background: var(--primary-soft);
@@ -585,6 +593,10 @@ body {
 .puzzle-piece.keyboard {
   transition: left 0.08s linear, top 0.08s linear;
 }
+/* 拖错后滑回托盘的过渡 */
+.puzzle-piece.settling {
+  transition: left 0.22s ease, top 0.22s ease;
+}
 .puzzle-piece.pz-right,
 .puzzle-piece.pz-wrong {
   cursor: default;
@@ -674,6 +686,31 @@ body {
   margin-top: 6px;
   white-space: normal;
   line-height: 1.35;
+}
+/* 「我不知道」：不算主动作，样式弱化，避免和交卷按钮抢视线 */
+.giveup-btn {
+  margin-top: 2px;
+  color: var(--text-muted);
+  border-style: dashed;
+  background: transparent;
+}
+.giveup-btn:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+.giveup-btn:disabled {
+  opacity: 0.45;
+}
+/* 点了「我不知道」后题目卡片上的说明 */
+.giveup-note {
+  margin-top: 14px;
+  padding: 8px 12px;
+  border: 1px dashed var(--wrong);
+  border-radius: 10px;
+  font-size: 13px;
+  color: var(--wrong);
+  background: var(--wrong-soft);
+  text-align: center;
 }
 
 /* ---------- 题号导航 ---------- */

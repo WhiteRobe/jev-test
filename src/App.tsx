@@ -4,6 +4,7 @@ import {
   POINTS_PER_QUESTION,
   QUESTIONS,
   QUIZ_SIZE,
+  UNKNOWN_ANSWER,
   formatPuzzlePoint,
   parsePuzzlePoint,
   puzzleHit,
@@ -28,8 +29,8 @@ type Phase = "intro" | "quiz" | "result";
 const WEBMCP_STORAGE_KEY = "jev-test:webmcp-mode";
 
 const SECTION_ORDER = ["判断对错", "单项选择", "图形点选", "人机交互检测"];
-/** 每次测验每个题型保底出现的题数（4 × 3 = 12，其余 18 题全库随机） */
-const PER_SECTION_MIN = 3;
+/** 每次测验每个题型保底出现的题数（4 × 4 = 16，其余 14 题全库随机） */
+const PER_SECTION_MIN = 4;
 
 const CLIP_PATHS: Record<string, string> = {
   triangle: "polygon(50% 0%, 100% 100%, 0% 100%)",
@@ -190,6 +191,13 @@ export function App() {
     setAnswers((prev) => ({ ...prev, [question.id]: optionId }));
   };
 
+  /** 「我不知道」：记入哨兵答案，视同已作答但判错 */
+  const giveUp = () => {
+    if (answers[question.id] !== undefined) return;
+    choose(UNKNOWN_ANSWER);
+    flash("giveup");
+  };
+
   const goTo = (index: number) => {
     setCurrent(index);
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -198,6 +206,11 @@ export function App() {
   const result = useMemo(() => {
     const detail = quizQuestions.map((q) => {
       const chosenId = answers[q.id];
+      // 「我不知道」：视同已作答，但一定判错
+      if (chosenId === UNKNOWN_ANSWER) {
+        const correct = q.options.find((o) => o.id === q.answer);
+        return { question: q, chosen: undefined, correct, unknown: true, isRight: false };
+      }
       if (q.type === "slider" && q.slider) {
         const chosenNum = chosenId === undefined ? undefined : Number(chosenId);
         const tolerance = q.slider.tolerance ?? 0;
@@ -262,6 +275,7 @@ export function App() {
     },
     goToQuestion: (number1) => goTo(number1 - 1),
     submit: () => setPhase("result"),
+    giveUp: () => giveUp(),
     longPress: (optionId, signal) => {
       const driver = lpDriverRef.current;
       if (!driver) return Promise.reject(new Error("当前题不支持长按操作"));
@@ -320,6 +334,12 @@ export function App() {
             <li>人机交互检测题：把滑块精确移动到指定数值，或在指定颜色按钮上连续长按 3 秒（中途松开 / 按错判错）。</li>
             <li>拼图验证码：把托盘里的缺图块拖到图片中的虚线缺口位置，松手即判定（偏出缺口太多算没对齐）。</li>
             <li>
+              拼图没拖对会自动复原、可以反复重拖，只有拖到缺口才算作答。
+            </li>
+            <li>
+              任何题都可以点右侧的「我不知道」直接作答：视同已作答（能交卷），但本题计为错误。
+            </li>
+            <li>
               每次开始都从 {BANK_SIZE} 题题库中随机抽 {QUIZ_SIZE} 题，{SECTION_ORDER.length}{" "}
               类题型每类至少出现 {PER_SECTION_MIN} 题，每题选项顺序也随机生成。
             </li>
@@ -364,7 +384,8 @@ export function App() {
           <p className="result-note">{grade.note}</p>
 
           <div className="review-list">
-            {result.detail.map(({ question: q, chosen, correct, chosenNum, point, isRight }, idx) => (
+            {result.detail.map(
+              ({ question: q, chosen, correct, chosenNum, point, unknown, isRight }, idx) => (
               <div className={`review-item ${isRight ? "right" : "wrong"}`} key={q.id}>
                 <div className="review-head">
                   <span className="review-no">{idx + 1}</span>
@@ -374,7 +395,39 @@ export function App() {
                   </span>
                 </div>
                 <div className="review-prompt">{q.prompt}</div>
-                {q.type === "puzzle" && q.puzzle ? (
+                {unknown ? (
+                  <>
+                    <div className="review-answer">
+                      <span className="answer-label">你的回答：</span>
+                      <span className="text-wrong">我不知道</span>
+                    </div>
+                    {q.type === "slider" && q.slider && (
+                      <div className="review-answer">
+                        <span className="answer-label">正确位置：</span>
+                        <span className="text-right">
+                          {q.slider.target}
+                          {q.slider.unit ?? ""}
+                        </span>
+                      </div>
+                    )}
+                    {q.type === "puzzle" && q.puzzle && (
+                      <div className="review-answer">
+                        <span className="answer-label">缺口位置：</span>
+                        <span className="text-right">
+                          {puzzlePointText({ x: q.puzzle.gapX, y: q.puzzle.gapY })}
+                        </span>
+                      </div>
+                    )}
+                    {q.type !== "slider" && q.type !== "puzzle" && correct && (
+                      <div className="review-answer">
+                        <span className="answer-label">正确答案：</span>
+                        <span className="text-right">
+                          <AnswerVisual option={correct} />
+                        </span>
+                      </div>
+                    )}
+                  </>
+                ) : q.type === "puzzle" && q.puzzle ? (
                   <>
                     <div className="review-answer">
                       <span className="answer-label">你的落点：</span>
@@ -429,7 +482,8 @@ export function App() {
                 )}
                 <div className="review-explanation">💡 {q.explanation}</div>
               </div>
-            ))}
+              ),
+            )}
           </div>
 
           <button type="button" className="btn primary large" onClick={() => startQuiz()}>
@@ -443,6 +497,8 @@ export function App() {
     const sectionIndex = SECTION_ORDER.indexOf(question.section);
     const isLast = current === quizQuestions.length - 1;
     const selected = answers[question.id];
+    // 点了「我不知道」：本题按答错锁定，交互控件不再改动答案
+    const gaveUp = selected === UNKNOWN_ANSWER;
 
     content = (
     <div className="page">
@@ -495,15 +551,17 @@ export function App() {
           {question.type === "slider" && question.slider ? (
             <SliderAnswer
               spec={question.slider}
-              value={selected === undefined ? undefined : Number(selected)}
+              value={selected === undefined || gaveUp ? undefined : Number(selected)}
               onChange={(value) => choose(String(value))}
+              disabled={gaveUp}
               agentFlash={flashTarget === "slider"}
             />
           ) : question.type === "puzzle" && question.puzzle ? (
             <PuzzleAnswer
               spec={question.puzzle}
-              value={selected}
+              value={gaveUp ? undefined : selected}
               onChange={choose}
+              disabled={gaveUp}
               registerDriver={(driver) => {
                 pzDriverRef.current = driver;
               }}
@@ -514,8 +572,9 @@ export function App() {
               options={optionsOrder[current]}
               duration={question.holdDuration ?? 3000}
               targetId={question.answer}
-              value={selected}
+              value={gaveUp ? undefined : selected}
               onChange={choose}
+              disabled={gaveUp}
               registerDriver={(driver) => {
                 lpDriverRef.current = driver;
               }}
@@ -540,6 +599,7 @@ export function App() {
                       question.type === "graphic" ? "option-graphic" : ""
                     } ${flashTarget === `option:${option.id}` ? "agent-flash" : ""}`}
                     onClick={() => choose(option.id)}
+                    disabled={gaveUp}
                     aria-pressed={active}
                   >
                     {question.type !== "graphic" && (
@@ -560,6 +620,9 @@ export function App() {
                 );
               })}
             </div>
+          )}
+          {gaveUp && (
+            <div className="giveup-note">本题已按「我不知道」记为答错，可翻页继续。</div>
           )}
         </div>
 
@@ -589,6 +652,17 @@ export function App() {
             title={allAnswered ? "提交并查看成绩" : `还有 ${quizQuestions.length - answeredCount} 题未作答`}
           >
             {allAnswered ? "提交并查看成绩" : `还差 ${quizQuestions.length - answeredCount} 题`}
+          </button>
+          <button
+            type="button"
+            className={`btn ghost rail-btn giveup-btn ${
+              flashTarget === "giveup" ? "agent-flash" : ""
+            }`}
+            onClick={giveUp}
+            disabled={selected !== undefined}
+            title="不会做也可以作答：视同已作答，但本题计为错误"
+          >
+            我不知道
           </button>
         </aside>
       </div>
@@ -657,11 +731,14 @@ function SliderAnswer({
   spec,
   value,
   onChange,
+  disabled = false,
   agentFlash = false,
 }: {
   spec: SliderSpec;
   value: number | undefined;
   onChange: (value: number) => void;
+  /** 点了「我不知道」时锁定，不再改动答案 */
+  disabled?: boolean;
   /** 由 WebMCP 工具设值时短暂高亮 */
   agentFlash?: boolean;
 }) {
@@ -671,7 +748,9 @@ function SliderAnswer({
   const unit = spec.unit ?? "";
   return (
     <div className={`slider-block${agentFlash ? " agent-flash" : ""}`}>
-      <div className="slider-readout">{value === undefined ? "未作答" : `${display}${unit}`}</div>
+      <div className="slider-readout">
+        {disabled ? "本题已放弃" : value === undefined ? "未作答" : `${display}${unit}`}
+      </div>
       <input
         type="range"
         className="slider-input"
@@ -681,6 +760,7 @@ function SliderAnswer({
         value={display}
         onChange={(event) => onChange(Number(event.target.value))}
         style={{ "--fill": `${percent}%` } as React.CSSProperties}
+        disabled={disabled}
         aria-label="滑块作答"
       />
       <div className="slider-scale">
@@ -693,7 +773,9 @@ function SliderAnswer({
           {unit}
         </span>
       </div>
-      <div className="slider-hint">拖动滑块，或点击后用键盘 ← → 方向键微调</div>
+      <div className="slider-hint">
+        {disabled ? "本题已按「我不知道」记为答错" : "拖动滑块，或点击后用键盘 ← → 方向键微调"}
+      </div>
     </div>
   );
 }
@@ -704,6 +786,7 @@ function LongPressAnswer({
   targetId,
   value,
   onChange,
+  disabled = false,
   registerDriver,
 }: {
   options: QuestionOption[];
@@ -711,6 +794,8 @@ function LongPressAnswer({
   targetId: string;
   value: string | undefined;
   onChange: (optionId: string) => void;
+  /** 点了「我不知道」时锁定，不再改动答案 */
+  disabled?: boolean;
   /** 注册命令式驱动，供 WebMCP 工具发起真实按压 */
   registerDriver?: (driver: LongPressDriver | null) => void;
 }) {
@@ -722,7 +807,9 @@ function LongPressAnswer({
   // 工具发起按压时，用这对 ref 把按压结果回传给 promise
   const resolveRef = useRef<(() => void) | null>(null);
   const rejectRef = useRef<((error: Error) => void) | null>(null);
-  const locked = value !== undefined;
+  // locked：本题不能再交互（已作答或点了「我不知道」）；
+  // 只有真正作答过（value 有值）时才在界面上标出对错与正确答案
+  const locked = value !== undefined || disabled;
 
   const cancelRaf = () => {
     if (rafRef.current !== undefined) cancelAnimationFrame(rafRef.current);
@@ -818,7 +905,7 @@ function LongPressAnswer({
         const isHeld = heldId === option.id;
         const isTarget = option.id === targetId;
         let stateClass = "";
-        if (locked) {
+        if (value !== undefined) {
           if (option.id === value) stateClass = isTarget ? "lp-correct" : "lp-wrong";
           else if (isTarget) stateClass = "lp-answer";
         }
@@ -856,15 +943,21 @@ function LongPressAnswer({
                   : `${(duration * (1 - progress) / 1000).toFixed(1)}s`}</span>
               </>
             )}
-            {locked && option.id === value && <span className="lp-badge">{isTarget ? "✓" : "✗"}</span>}
-            {locked && isTarget && option.id !== value && <span className="lp-badge">✓</span>}
+            {value !== undefined && option.id === value && (
+              <span className="lp-badge">{isTarget ? "✓" : "✗"}</span>
+            )}
+            {value !== undefined && isTarget && option.id !== value && (
+              <span className="lp-badge">✓</span>
+            )}
           </button>
         );
       })}
       <div className="lp-hint">
-        {locked
-          ? "本题已作答，可翻页继续"
-          : `用手指或鼠标在正确颜色上连续按住 ${duration / 1000} 秒（也可聚焦按钮后长按空格/回车）`}
+        {disabled
+          ? "本题已按「我不知道」记为答错，可翻页继续"
+          : locked
+            ? "本题已作答，可翻页继续"
+            : `用手指或鼠标在正确颜色上连续按住 ${duration / 1000} 秒（也可聚焦按钮后长按空格/回车）`}
       </div>
     </div>
   );
@@ -879,6 +972,7 @@ function PuzzleAnswer({
   spec,
   value,
   onChange,
+  disabled = false,
   registerDriver,
   agentFlash = false,
 }: {
@@ -886,6 +980,8 @@ function PuzzleAnswer({
   /** 已记录的落点，格式 "x,y" */
   value: string | undefined;
   onChange: (value: string) => void;
+  /** 点了「我不知道」时锁定，不再改动答案 */
+  disabled?: boolean;
   /** 注册命令式驱动，供 WebMCP 工具发起真实拖动 */
   registerDriver?: (driver: PuzzleDriver | null) => void;
   /** 由 WebMCP 工具拖动时短暂高亮 */
@@ -897,10 +993,17 @@ function PuzzleAnswer({
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   /** 键盘微调模式：加一点过渡动画，鼠标 / 触屏拖动时必须关掉 */
   const [keyboardMode, setKeyboardMode] = useState(false);
+  /** 复原动画：拖错时让图块平滑滑回托盘 */
+  const [settling, setSettling] = useState(false);
+  /** 未对准次数（用于提示文案）与缺口的高亮提示 */
+  const [missCount, setMissCount] = useState(0);
+  const [gapMiss, setGapMiss] = useState(false);
+  const settleTimerRef = useRef<number | undefined>(undefined);
+  const gapTimerRef = useRef<number | undefined>(undefined);
   // 拖动 / 动画过程中用 ref 跟随最新位置，避免 pointermove 读到过期闭包
   const posRef = useRef<{ x: number; y: number } | null>(null);
   const rafRef = useRef<number | undefined>(undefined);
-  const locked = value !== undefined;
+  const locked = value !== undefined || disabled;
   const lockedRef = useRef(locked);
   lockedRef.current = locked;
   const drop = value === undefined ? undefined : parsePuzzlePoint(value);
@@ -909,6 +1012,32 @@ function PuzzleAnswer({
   const moveTo = (next: { x: number; y: number } | null) => {
     posRef.current = next;
     setPos(next);
+  };
+
+  /** 图块滑回托盘（带一点过渡），不记录答案 */
+  const backToTray = () => {
+    moveTo(null);
+    setSettling(true);
+    if (settleTimerRef.current !== undefined) window.clearTimeout(settleTimerRef.current);
+    settleTimerRef.current = window.setTimeout(() => setSettling(false), 240);
+  };
+
+  /**
+   * 落点提交：对准缺口才记录答案；没对准则自动复原回托盘，可以继续重拖（不记录答案）。
+   * 返回是否对准，供工具驱动的 promise 决定 resolve / reject。
+   */
+  const commit = (point: { x: number; y: number }) => {
+    if (puzzleHit(spec, point)) {
+      moveTo(null);
+      onChange(formatPuzzlePoint(point.x, point.y));
+      return true;
+    }
+    setMissCount((count) => count + 1);
+    setGapMiss(true);
+    if (gapTimerRef.current !== undefined) window.clearTimeout(gapTimerRef.current);
+    gapTimerRef.current = window.setTimeout(() => setGapMiss(false), 700);
+    backToTray();
+    return false;
   };
 
   // 拼图块要按整图缩放取色，必须先量出图片实际像素
@@ -939,6 +1068,7 @@ function PuzzleAnswer({
     if (locked || stage.w === 0) return;
     event.currentTarget.setPointerCapture?.(event.pointerId);
     setKeyboardMode(false);
+    setSettling(false);
     moveTo(pointFromEvent(event));
   };
 
@@ -951,14 +1081,13 @@ function PuzzleAnswer({
     const current = posRef.current;
     if (locked || current === null) return;
     event.preventDefault();
-    moveTo(null);
-    onChange(formatPuzzlePoint(current.x, current.y));
+    commit(current);
   };
 
   // 拖动被系统打断（来电、切后台、pointercancel）时收回托盘，不记答案
   const abortDrag = () => {
     if (posRef.current === null) return;
-    moveTo(null);
+    backToTray();
   };
 
   const onKeyDown = (event: React.KeyboardEvent) => {
@@ -968,8 +1097,7 @@ function PuzzleAnswer({
       if (event.repeat) return;
       const current = posRef.current;
       if (current === null) return;
-      moveTo(null);
-      onChange(formatPuzzlePoint(current.x, current.y));
+      commit(current);
       return;
     }
     const step = event.shiftKey ? KEY_STEP_BIG : KEY_STEP;
@@ -983,6 +1111,7 @@ function PuzzleAnswer({
     if (!next) return;
     event.preventDefault();
     setKeyboardMode(true);
+    setSettling(false);
     moveTo({ x: clamp01(next.x), y: clamp01(next.y) });
   };
 
@@ -1025,8 +1154,11 @@ function PuzzleAnswer({
             if (rafRef.current !== undefined) cancelAnimationFrame(rafRef.current);
             rafRef.current = undefined;
             signal?.removeEventListener("abort", cancel);
-            moveTo(null);
-            onChange(formatPuzzlePoint(x, y));
+            // 与人类操作同规则：拖歪了图块复原、不记答案，工具侧按失败处理以便重试
+            if (!commit({ x, y })) {
+              reject(new Error("落点没有对齐缺口，拼图块已复原，请重试"));
+              return;
+            }
             resolve();
           };
           rafRef.current = requestAnimationFrame(step);
@@ -1035,11 +1167,13 @@ function PuzzleAnswer({
     return () => registerDriver(null);
   });
 
-  // 离开本题时停掉工具发起的拖动动画
+  // 离开本题时停掉工具发起的拖动动画与复原 / 提示定时器
   useEffect(
     () => () => {
       if (rafRef.current !== undefined) cancelAnimationFrame(rafRef.current);
       rafRef.current = undefined;
+      if (settleTimerRef.current !== undefined) window.clearTimeout(settleTimerRef.current);
+      if (gapTimerRef.current !== undefined) window.clearTimeout(gapTimerRef.current);
     },
     [],
   );
@@ -1048,7 +1182,8 @@ function PuzzleAnswer({
   const pieceClass = [
     "puzzle-piece",
     pos !== null ? "dragging" : "",
-    keyboardMode && pos !== null ? "keyboard" : "",
+    (keyboardMode || settling) && pos !== null ? "keyboard" : "",
+    settling ? "settling" : "",
     drop !== undefined ? (isRight ? "pz-right" : "pz-wrong") : "",
   ]
     .filter(Boolean)
@@ -1066,7 +1201,9 @@ function PuzzleAnswer({
         }}
       >
         <span
-          className={`puzzle-gap${drop !== undefined ? (isRight ? " filled" : " missed") : ""}`}
+          className={`puzzle-gap${
+            drop !== undefined ? (isRight ? " filled" : " missed") : gapMiss ? " missed" : ""
+          }`}
           style={{
             left: `${spec.gapX * 100}%`,
             top: `${spec.gapY * 100}%`,
@@ -1106,11 +1243,15 @@ function PuzzleAnswer({
       </div>
       <div className="puzzle-tray" style={{ marginTop: TRAY_MARGIN, height: TRAY_HEIGHT }} />
       <div className="puzzle-hint">
-        {drop === undefined
-          ? "按住拼图块拖到图片中的虚线缺口，松手即判定；也可聚焦后用 ← → ↑ ↓ 微调、Shift + 方向键大步移动、回车 / 空格确认"
-          : isRight
-            ? "拼图已对齐，图片补全成功"
-            : "落点没有对齐缺口，可在解析里查看正确位置"}
+        {disabled
+          ? "本题已按「我不知道」记为答错，可翻页继续"
+          : drop !== undefined
+            ? isRight
+              ? "拼图已对齐，图片补全成功"
+              : "落点没有对齐缺口"
+            : missCount > 0
+              ? `没有对齐缺口，拼图块已复原，请再拖一次（已尝试 ${missCount} 次）`
+              : "按住拼图块拖到图片中的虚线缺口，松手即判定；也可聚焦后用 ← → ↑ ↓ 微调、Shift + 方向键大步移动、回车 / 空格确认"}
       </div>
     </div>
   );

@@ -1,6 +1,7 @@
 import {
   POINTS_PER_QUESTION,
   QUIZ_SIZE,
+  UNKNOWN_ANSWER,
   type Question,
   type QuestionOption,
 } from "../questions";
@@ -20,6 +21,8 @@ export interface ReviewItem {
   chosenNum?: number;
   /** 拼图题的落点（归一化坐标） */
   point?: { x: number; y: number };
+  /** 点了「我不知道」：视同已作答但判错 */
+  unknown?: boolean;
   isRight: boolean;
 }
 
@@ -67,6 +70,8 @@ export interface QuizActions {
   /** 跳到 1-based 题号 */
   goToQuestion(number1: number): void;
   submit(): void;
+  /** 记为「我不知道」：视同已作答但判错（对应页面上的同名按钮） */
+  giveUp(): void;
   longPress(optionId: string, signal?: AbortSignal): Promise<void>;
   puzzleDrop(x: number, y: number, signal?: AbortSignal): Promise<void>;
   /** 让被工具操作的元素短暂高亮，保证工具调用在页面上可见 */
@@ -86,6 +91,8 @@ function currentQuestionView(snap: QuizSnapshot) {
     section: q.section,
     prompt: q.prompt,
     answered: snap.answers[q.id] !== undefined,
+    // 与页面上的「我不知道」按钮等价：视同已作答，但判错
+    giveUp: { optionId: UNKNOWN_ANSWER, label: "我不知道" },
   };
   if (q.type === "slider" && q.slider) {
     view.slider = {
@@ -121,6 +128,7 @@ function reviewView(item: ReviewItem, number: number) {
       section: q.section,
       prompt: q.prompt,
       isRight: item.isRight,
+      gaveUp: item.unknown === true,
       yourValue: item.chosenNum === undefined ? null : item.chosenNum,
       correctValue: q.slider.target,
       unit: q.slider.unit ?? "",
@@ -134,6 +142,7 @@ function reviewView(item: ReviewItem, number: number) {
       section: q.section,
       prompt: q.prompt,
       isRight: item.isRight,
+      gaveUp: item.unknown === true,
       yourPoint: item.point ?? null,
       correctPoint: { x: q.puzzle.gapX, y: q.puzzle.gapY },
       tolerance: q.puzzle.tolerance,
@@ -146,7 +155,8 @@ function reviewView(item: ReviewItem, number: number) {
     section: q.section,
     prompt: q.prompt,
     isRight: item.isRight,
-    yourAnswer: item.chosen ? item.chosen.label : null,
+    gaveUp: item.unknown === true,
+    yourAnswer: item.unknown ? "我不知道" : item.chosen ? item.chosen.label : null,
     correctAnswer: item.correct ? item.correct.label : null,
     explanation: q.explanation,
   };
@@ -229,7 +239,7 @@ export function buildTools(
   const answerCurrent: ModelContextTool = {
     name: "answer_current_question",
     description:
-      "Answer the CURRENT question and record the answer. For truefalse / single / graphic / longpress questions pass optionId (use an id returned by get_current_question). For slider questions pass the exact numeric value. For puzzle questions pass x and y, the normalized 0-1 coordinates inside the image box where the piece is dropped. Pass nothing else. For longpress questions the call holds the target button visibly for the required duration (default 3s) and only resolves after the press completes; if it is aborted the question stays unanswered. Puzzle questions are dragged visibly to (x, y) and released there; if the call is aborted the question stays unanswered.",
+      "Answer the CURRENT question and record the answer. For truefalse / single / graphic / longpress questions pass optionId (use an id returned by get_current_question). For slider questions pass the exact numeric value. For puzzle questions pass x and y, the normalized 0-1 coordinates inside the image box where the piece is dropped. Pass optionId \"unknown\" to record the in-app 「我不知道」button: it counts as answered but is always judged wrong. Pass nothing else. For longpress questions the call holds the target button visibly for the required duration (default 3s) and only resolves after the press completes; if it is aborted the question stays unanswered. Puzzle questions are dragged visibly to (x, y) and released there; a drop that misses the hole restores the piece and records nothing, so retry with better coordinates; if the call is aborted the question also stays unanswered.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -237,7 +247,7 @@ export function buildTools(
         optionId: {
           type: "string",
           description:
-            "Option id to select for choice questions (truefalse, single, graphic, longpress).",
+            'Option id to select for choice questions (truefalse, single, graphic, longpress), or "unknown" for any question to record 「我不知道」 (answered, always wrong).',
         },
         value: {
           type: "number",
@@ -273,6 +283,15 @@ export function buildTools(
         y?: unknown;
       };
       const actions = getActions();
+
+      // 「我不知道」：任何题型都可用，视同已作答但判错
+      if (optionId === UNKNOWN_ANSWER) {
+        if (typeof value !== "undefined" || typeof x !== "undefined" || typeof y !== "undefined") {
+          throw new Error(`「${UNKNOWN_ANSWER}」只能单独使用，不要同时传 value / x / y`);
+        }
+        actions.giveUp();
+        return ok({ recorded: true, number: snap.current + 1, optionId: UNKNOWN_ANSWER, judged: "wrong" });
+      }
 
       if (q.type === "slider") {
         if (typeof optionId !== "undefined") throw new Error("本题为滑块题，请只传入数值参数 value");

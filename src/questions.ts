@@ -1064,6 +1064,8 @@ export const QUESTIONS: Question[] = [
 ];
 
 export const POINTS_PER_QUESTION = 5;
+/** 「我不知道」按钮记入 answers 的哨兵值：视同已作答，但判为错误 */
+export const UNKNOWN_ANSWER = "unknown";
 /** 题库总题数（满分按题库总量计算，仅用于展示题库规模） */
 export const BANK_SIZE = QUESTIONS.length;
 /** 每次测验抽题数量 */
