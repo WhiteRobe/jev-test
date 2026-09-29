@@ -71,9 +71,15 @@ WebMCP 模式下通过命令式 API（`document.modelContext.registerTool`）按
 
 本地调试（Chrome 149+，API 处于 Origin Trial）：
 
-1. 打开 `chrome://flags/#enable-webmcp-testing` 启用并重启 Chrome；
+1. 打开 `chrome://flags/#enable-webmcp-testing` 启用并**完全重启 Chrome**（`Cmd+Q`，只刷新页面不生效）；
 2. `npm run dev` 后在页面右上角切到 WebMCP 模式；
 3. 安装 Model Context Tool Inspector 扩展，查看注册的工具、校验 JSON Schema 并手动调用。
+
+开关不可用时把鼠标悬停在「WebMCP 模式」上会给出具体原因（非安全上下文 / 非 Chrome / 未开 flag）；
+页面在打开 flag 之前就已加载的话，切回标签页时会自动重新探测，也可以直接刷新。
+
+自检一行命令：`typeof document.modelContext` 返回 `"object"` 才说明当前文档拿到了 API。
+注意这行必须在 **jev-test 这个标签页**的控制台里执行（其它站点的结果不作数），且要带 `https://` 或 `localhost`。
 
 工具定义见 `src/webmcp/tools.ts`，注册 / 注销生命周期见 `src/webmcp/useWebMcpTools.ts`。
 将来正式部署时还需在 `index.html` 配置 Origin Trial token（本次未包含）。

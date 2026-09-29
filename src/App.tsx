@@ -55,6 +55,16 @@ const KEY_STEP_BIG = 0.1;
 
 const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 
+/**
+ * 探测浏览器是否暴露 WebMCP API。
+ * 两种常见拿不到的情况：非 Chrome 149+ / 未开 chrome://flags/#enable-webmcp-testing；
+ * 以及用 http:// 访问（WebMCP 只在安全上下文暴露，Chrome 会把 http 自动升级为 https，
+ * 但若升级失败或被策略拦截，document 上就没有这个属性）。
+ */
+function detectWebMcpSupport(): boolean {
+  return typeof document !== "undefined" && "modelContext" in document;
+}
+
 /** 拼图落点的文字描述（结果页回看用） */
 const puzzlePointText = (point: { x: number; y: number }) =>
   `横向 ${(point.x * 100).toFixed(1)}% / 纵向 ${(point.y * 100).toFixed(1)}%`;
@@ -159,7 +169,18 @@ export function App() {
     }
   });
   // 不支持 document.modelContext 的浏览器（非 Chrome 149+ / 未开 flag）开关会锁定
-  const webmcpSupported = "modelContext" in document;
+  // 注意：WebMCP 只在安全上下文（https / localhost）暴露，http 访问会被浏览器自动判为不支持
+  const [webmcpSupported, setWebmcpSupported] = useState(() => detectWebMcpSupport());
+  // 页面可能是在打开 flag 之前加载的，切回前台时重新探测一次，避免必须手动刷新
+  useEffect(() => {
+    const recheck = () => setWebmcpSupported(detectWebMcpSupport());
+    window.addEventListener("focus", recheck);
+    document.addEventListener("visibilitychange", recheck);
+    return () => {
+      window.removeEventListener("focus", recheck);
+      document.removeEventListener("visibilitychange", recheck);
+    };
+  }, []);
 
   // 工具调用时被操作元素的短暂高亮目标（"slider" / "option:<id>"），让工具执行可见
   const [flashTarget, setFlashTarget] = useState<string | null>(null);
@@ -678,6 +699,15 @@ export function App() {
   );
 }
 
+/** 按钮不可用时，把「为什么」讲清楚（省得只能靠猜） */
+function supportHint(): string {
+  if (!isSecureContext) return "当前不是安全上下文，请用 https:// 或 localhost 访问";
+  if (!/Chrome|Edg\//.test(navigator.userAgent)) {
+    return "需要 Chrome 149+（含 Chromium 内核）";
+  }
+  return "需要 Chrome 149+ 并在 chrome://flags/#enable-webmcp-testing 开启后重启浏览器";
+}
+
 /** 右上角固定的普通 / WebMCP 模式分段开关 */
 function ModeToggle({
   mode,
@@ -706,7 +736,7 @@ function ModeToggle({
         title={
           supported
             ? "切换到 WebMCP 模式：向 AI 智能体开放结构化答题工具"
-            : "当前浏览器不支持 WebMCP：需要 Chrome 149+ 并在 chrome://flags/#enable-webmcp-testing 启用"
+            : `当前浏览器未暴露 WebMCP API（${supportHint()}）`
         }
         onClick={() => onChange(true)}
       >
