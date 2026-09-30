@@ -43,6 +43,11 @@
 
 介绍页和答题页顶部都有「拉题模式」开关，选择持久化在 `localStorage`（默认批量）：
 
+也可以通过 URL 参数直接指定，URL 中的有效值优先于 `localStorage`：
+
+- `loadMode=batch`：批量拉题
+- `loadMode=single`：单次拉题
+
 | 模式 | 什么时候请求题目 | 一次测验的请求数 |
 | --- | --- | --- |
 | **批量拉题**（默认） | 点「开始答题」时 `GET /api/questions?ids=<30 个 id>` 一次拿回本次全部题目 | 1 次 + 交卷 1 次（reveal） |
@@ -99,6 +104,7 @@ npm run deploy     # = vite build && wrangler deploy
 ## WebMCP 模式（实验）
 
 页面右上角有「普通模式 / WebMCP 模式」开关，选择持久化在 `localStorage`（默认普通模式）。
+也可以通过 URL 参数直接指定：`mode=normal` 或 `mode=webmcp`。两个模式开关在页面内发生变化时，地址栏参数会同步更新，复制 URL 即可复现当前组合。
 WebMCP 模式下通过命令式 API（`document.modelContext.registerTool`）按页面阶段向 AI 智能体注册结构化答题工具，与"模拟点击"的 GUI 促动赛道对应：
 
 - 介绍页：`get_app_state`、`start_quiz`（支持随机种子）

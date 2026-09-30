@@ -30,6 +30,28 @@ type Phase = "intro" | "quiz" | "result";
 const WEBMCP_STORAGE_KEY = "jev-test:webmcp-mode";
 /** 拉题模式开关的 localStorage key */
 const LOAD_MODE_STORAGE_KEY = "jev-test:load-mode";
+/** 可分享 URL 的模式参数：?mode=normal|webmcp&loadMode=batch|single */
+const WEBMCP_QUERY_KEY = "mode";
+const LOAD_MODE_QUERY_KEY = "loadMode";
+
+function readQueryParam(name: string): string | null {
+  try {
+    return new URLSearchParams(window.location.search).get(name);
+  } catch {
+    return null;
+  }
+}
+
+/** 模式切换后同步当前 URL，复制地址即可复现相同组合。 */
+function replaceQueryParam(name: string, value: string) {
+  try {
+    const url = new URL(window.location.href);
+    url.searchParams.set(name, value);
+    window.history.replaceState(window.history.state, "", url);
+  } catch {
+    /* 非标准浏览器环境下不影响页面内切换 */
+  }
+}
 
 const CLIP_PATHS: Record<string, string> = {
   triangle: "polygon(50% 0%, 100% 100%, 0% 100%)",
@@ -122,6 +144,8 @@ export function App() {
 
   // 拉题模式：batch = 开始答题时一次拉齐本次全部题目；single = 翻到哪题才请求哪题
   const [loadMode, setLoadMode] = useState<LoadMode>(() => {
+    const queryMode = readQueryParam(LOAD_MODE_QUERY_KEY);
+    if (queryMode === "single" || queryMode === "batch") return queryMode;
     try {
       return localStorage.getItem(LOAD_MODE_STORAGE_KEY) === "single" ? "single" : "batch";
     } catch {
@@ -134,6 +158,9 @@ export function App() {
 
   // WebMCP（结构化工具）模式开关；持久化到 localStorage，默认关闭
   const [webmcpMode, setWebmcpMode] = useState<boolean>(() => {
+    const queryMode = readQueryParam(WEBMCP_QUERY_KEY);
+    if (queryMode === "webmcp") return true;
+    if (queryMode === "normal") return false;
     try {
       return localStorage.getItem(WEBMCP_STORAGE_KEY) === "1";
     } catch {
@@ -403,6 +430,7 @@ export function App() {
   // ---------- WebMCP 模式：快照 / 动作桥 / 工具注册 ----------
   const toggleWebMcp = (on: boolean) => {
     setWebmcpMode(on);
+    replaceQueryParam(WEBMCP_QUERY_KEY, on ? "webmcp" : "normal");
     try {
       localStorage.setItem(WEBMCP_STORAGE_KEY, on ? "1" : "0");
     } catch {
@@ -413,6 +441,7 @@ export function App() {
   const toggleLoadMode = (mode: LoadMode) => {
     loadModeRef.current = mode;
     setLoadMode(mode);
+    replaceQueryParam(LOAD_MODE_QUERY_KEY, mode);
     try {
       localStorage.setItem(LOAD_MODE_STORAGE_KEY, mode === "single" ? "single" : "batch");
     } catch {
